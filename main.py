@@ -3,12 +3,32 @@ import requests
 import json
 import time
 from threading import Thread
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, TypedDict, Literal
+from jsonschema import validate, ValidationError
 
 API_URL = "http://localhost:8080/v1/chat/completions"
 
 
+class LLMResponse(TypedDict):
+    answer: str
+    confidence: float
+    intent: Literal["question", "command", "statement"]
+    data: Dict[str, Any]
+
+
 class LLMChat:
+    # Определяем схему JSON
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string", "minLength": 1},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "intent": {"type": "string", "enum": ["question", "command", "statement"]},
+            "data": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["answer", "confidence", "intent", "data"],
+    }
+
     def __init__(self, api_url: str = API_URL):
         self.api_url: str = api_url
         self.conversation_history: List[Dict[str, str]] = []
@@ -64,6 +84,97 @@ class LLMChat:
             progress_thread.join(timeout=0.5)
             print("\r" + " " * 30 + "\r", end="", flush=True)
             raise e
+
+    def get_json_response(
+        self, message: str, schema: Optional[Dict] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Получает ответ в JSON формате с валидацией по схеме"""
+
+        schema_to_use = schema or self.RESPONSE_SCHEMA
+
+        system_prompt = f"""
+Ты - ассистент, который возвращает ответы строго в JSON формате.
+
+Твоя задача - преобразовать ответ в JSON объект, соответствующий этой схеме:
+{json.dumps(schema_to_use, indent=2, ensure_ascii=False)}
+
+Правила:
+1. Возвращай ТОЛЬКО JSON объект, без любого другого текста
+2. Не используй markdown или другие обёртки
+3. Все строки должны быть в двойных кавычках
+4. Убедись, что JSON валидный
+5. Поле 'answer' содержит основной ответ на вопрос
+6. Поле 'confidence' показывает уверенность в ответе (0-1)
+7. Поле 'intent' определяет тип запроса (question/command/statement)
+8. Поле 'data' может содержать дополнительные данные
+"""
+
+        user_message = (
+            f"Вопрос: {message}\n\nВерни ответ строго в указанном JSON формате."
+        )
+
+        payload: Dict[str, Any] = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "max_tokens": 500,
+            "temperature": 0.1,  # Минимальная температура для точного JSON
+        }
+
+        try:
+            response: requests.Response = self.send_with_progress(payload)
+            response.raise_for_status()
+            result: Dict[str, Any] = response.json()
+
+            raw_response: str = result["choices"][0]["message"]["content"].strip()
+
+            # Очищаем ответ от возможной разметки
+            if raw_response.startswith("```json"):
+                raw_response = raw_response[7:]
+            if raw_response.startswith("```"):
+                raw_response = raw_response[3:]
+            if raw_response.endswith("```"):
+                raw_response = raw_response[:-3]
+
+            raw_response = raw_response.strip()
+
+            # Парсим JSON
+            parsed_json: Dict[str, Any] = json.loads(raw_response)
+
+            # Валидируем по схеме
+            validate(instance=parsed_json, schema=schema_to_use)
+
+            print(
+                f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
+            )
+
+            # Сохраняем в историю
+            self.conversation_history.append(
+                {
+                    "role": "assistant",
+                    "content": json.dumps(parsed_json, ensure_ascii=False),
+                }
+            )
+
+            return parsed_json
+
+        except json.JSONDecodeError as e:
+            print(f"\nОшибка парсинга JSON: {e}")
+            print(f"Ответ модели: {raw_response}")
+            return None
+        except ValidationError as e:
+            print(f"\nОшибка валидации схемы: {e}")
+            return None
+        except requests.exceptions.Timeout:
+            print("\nОшибка: Превышено время ожидания ответа от модели")
+            return None
+        except requests.exceptions.ConnectionError:
+            print("\nОшибка: Не удалось подключиться к серверу")
+            return None
+        except Exception as e:
+            print(f"\nОшибка: {e}")
+            return None
 
     def send_message_streaming(
         self, message: str, system_prompt: str = "Ты полезный ассистент."
@@ -176,6 +287,8 @@ class LLMChat:
         print("  /clear  - Очистить историю диалога")
         print("  /history - Показать историю диалога")
         print("  /status - Проверить статус сервера")
+        print("  /json   - Режим JSON ответов")
+        print("  /normal - Обычный режим ответов")
         print("  /help   - Показать эту справку")
         print("  /exit или /quit - Выйти из программы")
         print("=" * 50 + "\n")
@@ -191,9 +304,10 @@ class LLMChat:
         print("=" * 50)
         for i, msg in enumerate(self.conversation_history, 1):
             role_label: str = "Пользователь" if msg["role"] == "user" else "Ассистент"
-            print(
-                f"{role_label}: {msg['content'][:100]}{'...' if len(msg['content']) > 100 else ''}"
-            )
+            content_preview: str = msg["content"][:100]
+            if len(msg["content"]) > 100:
+                content_preview += "..."
+            print(f"{role_label}: {content_preview}")
         print("=" * 50 + "\n")
 
     def check_status(self) -> None:
@@ -226,13 +340,14 @@ class LLMChat:
 
         print()
 
-    def run(self, use_streaming: bool = False) -> None:
+    def run(self, use_streaming: bool = False, use_json_mode: bool = False) -> None:
         """Запускает основной цикл чата"""
         print("\n" + "=" * 50)
         print("ДОБРО ПОЖАЛОВАТЬ В ЧАТ С LOCAL LLM")
         print("=" * 50)
         print(f"Модель: Qwen3-4B-Instruct (локальная)")
         print(f"Режим: {'потоковый' if use_streaming else 'обычный'}")
+        print(f"Формат ответа: {'JSON' if use_json_mode else 'текстовый'}")
         print("Введите /help для списка команд")
         print("=" * 50 + "\n")
 
@@ -270,14 +385,35 @@ class LLMChat:
                 elif user_input == "/status":
                     self.check_status()
                     continue
+                elif user_input == "/json":
+                    use_json_mode = True
+                    print("\nПереключено в режим JSON ответов\n")
+                    continue
+                elif user_input == "/normal":
+                    use_json_mode = False
+                    print("\nПереключено в обычный режим ответов\n")
+                    continue
                 elif not user_input:
                     continue
 
                 # Отправляем сообщение модели
-                if use_streaming:
-                    self.send_message_streaming(user_input)
+                if use_json_mode:
+                    # JSON режим
+                    result = self.get_json_response(user_input)
+                    if result:
+                        print(f"\nОтвет: {result.get('answer', '')}")
+                        print(f"Уверенность: {result.get('confidence', 0)}")
+                        print(f"Интент: {result.get('intent', '')}")
+                        if result.get("data"):
+                            print(
+                                f"Данные: {json.dumps(result['data'], ensure_ascii=False)}"
+                            )
                 else:
-                    self.send_message_simple(user_input)
+                    # Обычный режим
+                    if use_streaming:
+                        self.send_message_streaming(user_input)
+                    else:
+                        self.send_message_simple(user_input)
 
                 print()  # Пустая строка для разделения сообщений
 
@@ -297,13 +433,15 @@ def main() -> None:
     print("Выберите режим работы:")
     print("1. Обычный режим (модель думает, затем выдает полный ответ)")
     print("2. Потоковый режим (ответ появляется по словам в реальном времени)")
+    print("3. JSON режим (структурированные ответы)")
 
-    choice: str = input("\nВаш выбор (1/2): ").strip()
+    choice: str = input("\nВаш выбор (1/2/3): ").strip()
 
     use_streaming: bool = choice == "2"
+    use_json_mode: bool = choice == "3"
 
     # Запускаем чат
-    chat.run(use_streaming=use_streaming)
+    chat.run(use_streaming=use_streaming, use_json_mode=use_json_mode)
 
 
 if __name__ == "__main__":
