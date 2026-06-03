@@ -118,7 +118,7 @@ class LLMChat:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            "max_tokens": 500,
+            "max_tokens": 50000,
             "temperature": 0.1,  # Минимальная температура для точного JSON
         }
 
@@ -187,7 +187,7 @@ class LLMChat:
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
             + self.conversation_history,
-            "max_tokens": 1000,
+            "max_tokens": 50000,
             "temperature": 0.7,
             "stream": True,  # Включаем потоковый режим
         }
@@ -242,7 +242,7 @@ class LLMChat:
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
             + self.conversation_history,
-            "max_tokens": 1000,
+            "max_tokens": 50000,
             "temperature": 0.7,
         }
 
