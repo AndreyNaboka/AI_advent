@@ -7,6 +7,7 @@ from typing import List, Dict, Optional, Any, TypedDict, Literal
 from jsonschema import validate, ValidationError
 
 API_URL = "http://localhost:8080/v1/chat/completions"
+DEFAULT_TEMPERATURE = 0.7
 
 
 class LLMResponse(TypedDict):
@@ -37,14 +38,11 @@ class LLMChat:
     def check_server(self) -> bool:
         """Проверяет, доступен ли сервер"""
         try:
-            # Простая проверка через options запрос
             requests.options(self.api_url, timeout=2)
             return True
         except:
-            # Альтернативная проверка - пробуем подключиться к порту
             try:
                 import socket
-
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
                 result = sock.connect_ex(("localhost", 8080))
@@ -53,11 +51,22 @@ class LLMChat:
             except:
                 return False
 
+    def get_temperature_from_user(self) -> float:
+        """Запрашивает температуру у пользователя. Enter -> значение по умолчанию"""
+        user_input = input(f"Температура (Enter для {DEFAULT_TEMPERATURE}): ").strip()
+        if user_input == "":
+            return DEFAULT_TEMPERATURE
+        try:
+            temp = float(user_input)
+            return max(0.0, min(2.0, temp))
+        except ValueError:
+            print(f"Некорректный ввод, используем {DEFAULT_TEMPERATURE}")
+            return DEFAULT_TEMPERATURE
+
     def send_with_progress(self, payload: Dict[str, Any]) -> requests.Response:
         """Отправляет запрос с индикатором прогресса"""
         print("Модель думает", end="", flush=True)
 
-        # Запускаем индикатор прогресса в отдельном потоке
         stop_animation: bool = False
 
         def show_progress() -> None:
@@ -77,7 +86,7 @@ class LLMChat:
             )
             stop_animation = True
             progress_thread.join(timeout=0.5)
-            print("\r" + " " * 30 + "\r", end="", flush=True)  # Очищаем строку
+            print("\r" + " " * 30 + "\r", end="", flush=True)
             return response
         except Exception as e:
             stop_animation = True
@@ -86,10 +95,9 @@ class LLMChat:
             raise e
 
     def get_json_response(
-        self, message: str, schema: Optional[Dict] = None
+        self, message: str, temperature: float, schema: Optional[Dict] = None
     ) -> Optional[Dict[str, Any]]:
-        """Получает ответ в JSON формате с валидацией по схеме"""
-
+        """Получает ответ в JSON формате с валидацией по схеме, показывает время и токены"""
         schema_to_use = schema or self.RESPONSE_SCHEMA
 
         system_prompt = f"""
@@ -119,13 +127,17 @@ class LLMChat:
                 {"role": "user", "content": user_message},
             ],
             "max_tokens": 50000,
-            "temperature": 0.1,  # Минимальная температура для точного JSON
+            "temperature": temperature,
         }
+
+        start_time = time.time()
 
         try:
             response: requests.Response = self.send_with_progress(payload)
             response.raise_for_status()
             result: Dict[str, Any] = response.json()
+
+            elapsed_time = time.time() - start_time
 
             raw_response: str = result["choices"][0]["message"]["content"].strip()
 
@@ -145,11 +157,18 @@ class LLMChat:
             # Валидируем по схеме
             validate(instance=parsed_json, schema=schema_to_use)
 
+            # Получаем информацию о токенах
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", 0)
+
             print(
                 f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
             )
+            print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
+            print(f"🔢 Токены: запрос {prompt_tokens}, ответ {completion_tokens}, всего {total_tokens}")
 
-            # Сохраняем в историю
             self.conversation_history.append(
                 {
                     "role": "assistant",
@@ -177,27 +196,26 @@ class LLMChat:
             return None
 
     def send_message_streaming(
-        self, message: str, system_prompt: str = "Ты полезный ассистент."
+        self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
     ) -> Optional[str]:
-        """Отправляет сообщение с потоковой передачей ответа (постепенный вывод)"""
+        """Отправляет сообщение с потоковой передачей ответа, показывает время и примерную длину"""
 
-        # Добавляем сообщение в историю
         self.conversation_history.append({"role": "user", "content": message})
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
             + self.conversation_history,
             "max_tokens": 50000,
-            "temperature": 0.7,
-            "stream": True,  # Включаем потоковый режим
+            "temperature": temperature,
+            "stream": True,
         }
 
+        start_time = time.time()
         print("\nАссистент: ", end="", flush=True)
 
         full_response: str = ""
+
         try:
-            # Для потокового режима нужен отдельный эндпоинт или обработка
-            # В llama.cpp сервере потоковый режим работает через событийный поток
             response: requests.Response = requests.post(
                 self.api_url, json=payload, stream=True, timeout=60
             )
@@ -207,24 +225,26 @@ class LLMChat:
                     line_str: str = line.decode("utf-8")
                     if line_str.startswith("data: "):
                         data: str = line_str[6:]
-                        if data != "[DONE]":
-                            try:
-                                chunk: Dict[str, Any] = json.loads(data)
-                                if "choices" in chunk and chunk["choices"][0].get(
-                                    "delta", {}
-                                ).get("content"):
-                                    content: str = chunk["choices"][0]["delta"][
-                                        "content"
-                                    ]
-                                    print(content, end="", flush=True)
-                                    full_response += content
-                            except:
-                                pass
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk: Dict[str, Any] = json.loads(data)
+                            if "choices" in chunk and chunk["choices"][0].get("delta", {}).get("content"):
+                                content: str = chunk["choices"][0]["delta"]["content"]
+                                print(content, end="", flush=True)
+                                full_response += content
+                        except:
+                            pass
 
-            print()  # Новая строка после ответа
-            self.conversation_history.append(
-                {"role": "assistant", "content": full_response}
-            )
+            elapsed_time = time.time() - start_time
+            print()
+
+            # Приблизительный подсчёт токенов (среднее: 1 токен ~= 3 символа для русского/английского)
+            approx_tokens = len(full_response) // 3
+            print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
+            print(f"📝 Примерная длина: {len(full_response)} символов (~{approx_tokens} токенов)")
+
+            self.conversation_history.append({"role": "assistant", "content": full_response})
             return full_response
 
         except Exception as e:
@@ -232,100 +252,93 @@ class LLMChat:
             return None
 
     def send_message_simple(
-        self, message: str, system_prompt: str = "Ты полезный ассистент."
+        self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
     ) -> Optional[str]:
-        """Отправляет сообщение без потокового вывода"""
-
-        # Добавляем сообщение в историю
+        """Отправляет сообщение без потокового вывода, показывает время и токены"""
         self.conversation_history.append({"role": "user", "content": message})
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
             + self.conversation_history,
             "max_tokens": 50000,
-            "temperature": 0.7,
+            "temperature": temperature,
         }
+
+        start_time = time.time()
 
         try:
             response: requests.Response = self.send_with_progress(payload)
             response.raise_for_status()
             result: Dict[str, Any] = response.json()
 
+            elapsed_time = time.time() - start_time
+
             assistant_message: str = result["choices"][0]["message"]["content"]
             print(f"\nАссистент: {assistant_message}")
 
-            # Сохраняем ответ в историю
-            self.conversation_history.append(
-                {"role": "assistant", "content": assistant_message}
-            )
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", 0)
+
+            print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
+            print(f"🔢 Токены: запрос {prompt_tokens}, ответ {completion_tokens}, всего {total_tokens}")
+
+            self.conversation_history.append({"role": "assistant", "content": assistant_message})
             return assistant_message
 
         except requests.exceptions.Timeout:
             print("\nОшибка: Превышено время ожидания ответа от модели")
             return None
         except requests.exceptions.ConnectionError:
-            print(
-                "\nОшибка: Не удалось подключиться к серверу. Запустите сервер командой:"
-            )
-            print(
-                "   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080"
-            )
+            print("\nОшибка: Не удалось подключиться к серверу. Запустите сервер командой:")
+            print("   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
             return None
         except Exception as e:
             print(f"\nОшибка: {e}")
             return None
 
     def clear_history(self) -> None:
-        """Очищает историю диалога"""
         self.conversation_history = []
         print("История диалога очищена")
 
     def show_help(self) -> None:
-        """Показывает справку"""
         print("\n" + "=" * 50)
         print("Команды:")
-        print("  /clear  - Очистить историю диалога")
+        print("  /clear   - Очистить историю диалога")
         print("  /history - Показать историю диалога")
-        print("  /status - Проверить статус сервера")
-        print("  /json   - Режим JSON ответов")
-        print("  /normal - Обычный режим ответов")
-        print("  /help   - Показать эту справку")
-        print("  /exit или /quit - Выйти из программы")
+        print("  /status  - Проверить статус сервера")
+        print("  /json    - Режим JSON ответов")
+        print("  /normal  - Обычный режим ответов")
+        print("  /help    - Показать эту справку")
+        print("  /exit    - Выйти из программы")
         print("=" * 50 + "\n")
 
     def show_history(self) -> None:
-        """Показывает историю диалога"""
         if not self.conversation_history:
             print("\nИстория пуста\n")
             return
-
         print("\n" + "=" * 50)
         print("ИСТОРИЯ ДИАЛОГА:")
         print("=" * 50)
         for i, msg in enumerate(self.conversation_history, 1):
-            role_label: str = "Пользователь" if msg["role"] == "user" else "Ассистент"
-            content_preview: str = msg["content"][:100]
+            role_label = "Пользователь" if msg["role"] == "user" else "Ассистент"
+            content_preview = msg["content"][:100]
             if len(msg["content"]) > 100:
                 content_preview += "..."
             print(f"{role_label}: {content_preview}")
         print("=" * 50 + "\n")
 
     def check_status(self) -> None:
-        """Проверяет статус сервера"""
         print("\nПроверка статуса...")
-
         if self.check_server():
             print("Сервер доступен (порт 8080)")
-
-            # Дополнительная проверка - пробный запрос
             try:
-                test_payload: Dict[str, Any] = {
+                test_payload = {
                     "messages": [{"role": "user", "content": "ping"}],
                     "max_tokens": 5,
                 }
-                response: requests.Response = requests.post(
-                    self.api_url, json=test_payload, timeout=5
-                )
+                response = requests.post(self.api_url, json=test_payload, timeout=5)
                 if response.status_code == 200:
                     print("Модель отвечает на запросы")
                 else:
@@ -334,14 +347,10 @@ class LLMChat:
                 print("Модель не отвечает на тестовый запрос")
         else:
             print("Сервер недоступен! Запустите сервер командой:")
-            print(
-                "   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080"
-            )
-
+            print("   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
         print()
 
     def run(self, use_streaming: bool = False, use_json_mode: bool = False) -> None:
-        """Запускает основной цикл чата"""
         print("\n" + "=" * 50)
         print("ДОБРО ПОЖАЛОВАТЬ В ЧАТ С LOCAL LLM")
         print("=" * 50)
@@ -351,14 +360,11 @@ class LLMChat:
         print("Введите /help для списка команд")
         print("=" * 50 + "\n")
 
-        # Проверяем доступность сервера при старте
         if not self.check_server():
             print("СЕРВЕР НЕ ДОСТУПЕН!")
             print("\nЗапустите сервер в другом терминале:")
             print("cd ~/llm_project && source venv/bin/activate")
-            print(
-                "python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080"
-            )
+            print("python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
             print("\nПосле запуска сервера, перезапустите эту программу.")
             return
 
@@ -366,10 +372,8 @@ class LLMChat:
 
         while self.running:
             try:
-                # Получаем ввод пользователя
-                user_input: str = input("Вы: ").strip()
+                user_input = input("Вы: ").strip()
 
-                # Проверяем команды
                 if user_input.lower() in ["/exit", "/quit", "выход", "exit", "quit"]:
                     print("\nДо свидания!")
                     break
@@ -396,26 +400,24 @@ class LLMChat:
                 elif not user_input:
                     continue
 
-                # Отправляем сообщение модели
+                temperature = self.get_temperature_from_user()
+                print(f"Используется температура: {temperature}")
+
                 if use_json_mode:
-                    # JSON режим
-                    result = self.get_json_response(user_input)
+                    result = self.get_json_response(user_input, temperature)
                     if result:
                         print(f"\nОтвет: {result.get('answer', '')}")
                         print(f"Уверенность: {result.get('confidence', 0)}")
                         print(f"Интент: {result.get('intent', '')}")
                         if result.get("data"):
-                            print(
-                                f"Данные: {json.dumps(result['data'], ensure_ascii=False)}"
-                            )
+                            print(f"Данные: {json.dumps(result['data'], ensure_ascii=False)}")
                 else:
-                    # Обычный режим
                     if use_streaming:
-                        self.send_message_streaming(user_input)
+                        self.send_message_streaming(user_input, temperature)
                     else:
-                        self.send_message_simple(user_input)
+                        self.send_message_simple(user_input, temperature)
 
-                print()  # Пустая строка для разделения сообщений
+                print()
 
             except KeyboardInterrupt:
                 print("\n\nПрервано пользователем. До свидания!")
@@ -426,21 +428,17 @@ class LLMChat:
 
 
 def main() -> None:
-    # Создаем экземпляр чата
     chat = LLMChat()
-
-    # Выбираем режим работы
     print("Выберите режим работы:")
     print("1. Обычный режим (модель думает, затем выдает полный ответ)")
     print("2. Потоковый режим (ответ появляется по словам в реальном времени)")
     print("3. JSON режим (структурированные ответы)")
 
-    choice: str = input("\nВаш выбор (1/2/3): ").strip()
+    choice = input("\nВаш выбор (1/2/3): ").strip()
 
-    use_streaming: bool = choice == "2"
-    use_json_mode: bool = choice == "3"
+    use_streaming = choice == "2"
+    use_json_mode = choice == "3"
 
-    # Запускаем чат
     chat.run(use_streaming=use_streaming, use_json_mode=use_json_mode)
 
 
