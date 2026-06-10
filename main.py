@@ -2,12 +2,14 @@
 import requests
 import json
 import time
+from pathlib import Path
 from threading import Thread
 from typing import List, Dict, Optional, Any, TypedDict, Literal
 from jsonschema import validate, ValidationError
 
 API_URL = "http://localhost:8080/v1/chat/completions"
 DEFAULT_TEMPERATURE = 0.7
+HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
 
 
 class LLMResponse(TypedDict):
@@ -30,10 +32,57 @@ class LLMChat:
         "required": ["answer", "confidence", "intent", "data"],
     }
 
-    def __init__(self, api_url: str = API_URL):
+    def __init__(self, api_url: str = API_URL, history_file: Path = HISTORY_FILE):
         self.api_url: str = api_url
-        self.conversation_history: List[Dict[str, str]] = []
+        self.history_file = history_file
+        self.conversation_history: List[Dict[str, str]] = self.load_history()
         self.running: bool = True
+
+    def load_history(self) -> List[Dict[str, str]]:
+        """Загружает историю диалога из файла между запусками."""
+        if not self.history_file.exists():
+            return []
+
+        try:
+            with self.history_file.open("r", encoding="utf-8") as file:
+                history = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить историю диалога: {e}")
+            return []
+
+        if not isinstance(history, list):
+            print("Файл истории имеет неверный формат, начинаем с пустой истории")
+            return []
+
+        valid_history: List[Dict[str, str]] = []
+        for message in history:
+            if (
+                isinstance(message, dict)
+                and message.get("role") in {"user", "assistant"}
+                and isinstance(message.get("content"), str)
+            ):
+                valid_history.append(
+                    {"role": message["role"], "content": message["content"]}
+                )
+
+        skipped = len(history) - len(valid_history)
+        if skipped:
+            print(f"Пропущено некорректных сообщений в истории: {skipped}")
+
+        return valid_history
+
+    def save_history(self) -> None:
+        """Сохраняет историю диалога в файл."""
+        try:
+            with self.history_file.open("w", encoding="utf-8") as file:
+                json.dump(
+                    self.conversation_history,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError as e:
+            print(f"Не удалось сохранить историю диалога: {e}")
 
     def check_server(self) -> bool:
         """Проверяет, доступен ли сервер"""
@@ -121,11 +170,12 @@ class LLMChat:
             f"Вопрос: {message}\n\nВерни ответ строго в указанном JSON формате."
         )
 
+        self.conversation_history.append({"role": "user", "content": message})
+
         payload: Dict[str, Any] = {
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
+            "messages": [{"role": "system", "content": system_prompt}]
+            + self.conversation_history[:-1]
+            + [{"role": "user", "content": user_message}],
             "max_tokens": 50000,
             "temperature": temperature,
         }
@@ -175,6 +225,7 @@ class LLMChat:
                     "content": json.dumps(parsed_json, ensure_ascii=False),
                 }
             )
+            self.save_history()
 
             return parsed_json
 
@@ -245,6 +296,7 @@ class LLMChat:
             print(f"📝 Примерная длина: {len(full_response)} символов (~{approx_tokens} токенов)")
 
             self.conversation_history.append({"role": "assistant", "content": full_response})
+            self.save_history()
             return full_response
 
         except Exception as e:
@@ -285,6 +337,7 @@ class LLMChat:
             print(f"🔢 Токены: запрос {prompt_tokens}, ответ {completion_tokens}, всего {total_tokens}")
 
             self.conversation_history.append({"role": "assistant", "content": assistant_message})
+            self.save_history()
             return assistant_message
 
         except requests.exceptions.Timeout:
@@ -300,6 +353,11 @@ class LLMChat:
 
     def clear_history(self) -> None:
         self.conversation_history = []
+        try:
+            self.history_file.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"История очищена в памяти, но файл удалить не удалось: {e}")
+            return
         print("История диалога очищена")
 
     def show_help(self) -> None:
@@ -358,6 +416,9 @@ class LLMChat:
         print(f"Режим: {'потоковый' if use_streaming else 'обычный'}")
         print(f"Формат ответа: {'JSON' if use_json_mode else 'текстовый'}")
         print("Введите /help для списка команд")
+        print(f"Файл истории: {self.history_file}")
+        if self.conversation_history:
+            print(f"Загружено сообщений из истории: {len(self.conversation_history)}")
         print("=" * 50 + "\n")
 
         if not self.check_server():
