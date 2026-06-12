@@ -34,9 +34,12 @@ class LLMChat:
 
     def __init__(self, api_url: str = API_URL, history_file: Path = HISTORY_FILE):
         self.api_url: str = api_url
+        self.tokenize_url: str = api_url.split("/v1/", 1)[0] + "/tokenize"
         self.history_file = history_file
         self.conversation_history: List[Dict[str, str]] = self.load_history()
         self.running: bool = True
+        self.tokenize_available: Optional[bool] = None
+        self.last_token_counts: Optional[Dict[str, int]] = None
 
     def load_history(self) -> List[Dict[str, str]]:
         """Загружает историю диалога из файла между запусками."""
@@ -83,6 +86,55 @@ class LLMChat:
                 )
         except OSError as e:
             print(f"Не удалось сохранить историю диалога: {e}")
+
+    def count_text_tokens(self, text: str) -> int:
+        """Считает токены через локальный сервер, при недоступности использует оценку."""
+        if not text:
+            return 0
+
+        if self.tokenize_available is not False:
+            try:
+                response = requests.post(
+                    self.tokenize_url,
+                    json={"content": text},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                result = response.json()
+                tokens = result.get("tokens")
+                if isinstance(tokens, list):
+                    self.tokenize_available = True
+                    return len(tokens)
+            except Exception:
+                self.tokenize_available = False
+
+        return max(1, len(text) // 3)
+
+    def count_history_tokens(self) -> int:
+        """Считает токены всей сохраненной истории диалога."""
+        history_text = "\n".join(
+            f"{message['role']}: {message['content']}"
+            for message in self.conversation_history
+        )
+        return self.count_text_tokens(history_text)
+
+    def build_token_counts(self, current_request: str, model_response: str) -> Dict[str, int]:
+        return {
+            "current_request": self.count_text_tokens(current_request),
+            "history": self.count_history_tokens(),
+            "model_response": self.count_text_tokens(model_response),
+        }
+
+    def print_token_counts(self, counts: Dict[str, int]) -> None:
+        print("Токены:")
+        print(f"   Текущий запрос: {counts['current_request']}")
+        print(f"   Вся история диалога: {counts['history']}")
+        print(f"   Ответ модели: {counts['model_response']}")
+
+    def print_last_token_counts(self) -> None:
+        if self.last_token_counts is not None:
+            self.print_token_counts(self.last_token_counts)
+            self.last_token_counts = None
 
     def check_server(self) -> bool:
         """Проверяет, доступен ли сервер"""
@@ -146,8 +198,9 @@ class LLMChat:
     def get_json_response(
         self, message: str, temperature: float, schema: Optional[Dict] = None
     ) -> Optional[Dict[str, Any]]:
-        """Получает ответ в JSON формате с валидацией по схеме, показывает время и токены"""
+        """Получает ответ в JSON формате с валидацией по схеме."""
         schema_to_use = schema or self.RESPONSE_SCHEMA
+        raw_response: str = ""
 
         system_prompt = f"""
 Ты - ассистент, который возвращает ответы строго в JSON формате.
@@ -207,17 +260,10 @@ class LLMChat:
             # Валидируем по схеме
             validate(instance=parsed_json, schema=schema_to_use)
 
-            # Получаем информацию о токенах
-            usage = result.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
-            total_tokens = usage.get("total_tokens", 0)
-
             print(
                 f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
             )
             print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
-            print(f"🔢 Токены: запрос {prompt_tokens}, ответ {completion_tokens}, всего {total_tokens}")
 
             self.conversation_history.append(
                 {
@@ -225,6 +271,7 @@ class LLMChat:
                     "content": json.dumps(parsed_json, ensure_ascii=False),
                 }
             )
+            self.last_token_counts = self.build_token_counts(message, raw_response)
             self.save_history()
 
             return parsed_json
@@ -249,7 +296,7 @@ class LLMChat:
     def send_message_streaming(
         self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
     ) -> Optional[str]:
-        """Отправляет сообщение с потоковой передачей ответа, показывает время и примерную длину"""
+        """Отправляет сообщение с потоковой передачей ответа, показывает время и токены."""
 
         self.conversation_history.append({"role": "user", "content": message})
 
@@ -290,13 +337,12 @@ class LLMChat:
             elapsed_time = time.time() - start_time
             print()
 
-            # Приблизительный подсчёт токенов (среднее: 1 токен ~= 3 символа для русского/английского)
-            approx_tokens = len(full_response) // 3
-            print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
-            print(f"📝 Примерная длина: {len(full_response)} символов (~{approx_tokens} токенов)")
-
             self.conversation_history.append({"role": "assistant", "content": full_response})
+            token_counts = self.build_token_counts(message, full_response)
             self.save_history()
+
+            print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
+            self.print_token_counts(token_counts)
             return full_response
 
         except Exception as e:
@@ -328,16 +374,12 @@ class LLMChat:
             assistant_message: str = result["choices"][0]["message"]["content"]
             print(f"\nАссистент: {assistant_message}")
 
-            usage = result.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
-            total_tokens = usage.get("total_tokens", 0)
+            self.conversation_history.append({"role": "assistant", "content": assistant_message})
+            token_counts = self.build_token_counts(message, assistant_message)
+            self.save_history()
 
             print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
-            print(f"🔢 Токены: запрос {prompt_tokens}, ответ {completion_tokens}, всего {total_tokens}")
-
-            self.conversation_history.append({"role": "assistant", "content": assistant_message})
-            self.save_history()
+            self.print_token_counts(token_counts)
             return assistant_message
 
         except requests.exceptions.Timeout:
@@ -472,6 +514,7 @@ class LLMChat:
                         print(f"Интент: {result.get('intent', '')}")
                         if result.get("data"):
                             print(f"Данные: {json.dumps(result['data'], ensure_ascii=False)}")
+                        self.print_last_token_counts()
                 else:
                     if use_streaming:
                         self.send_message_streaming(user_input, temperature)
