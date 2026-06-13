@@ -10,6 +10,8 @@ from jsonschema import validate, ValidationError
 API_URL = "http://localhost:8080/v1/chat/completions"
 DEFAULT_TEMPERATURE = 0.7
 HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
+SUMMARY_FILE = Path(__file__).with_name("conversation_summary.json")
+RECENT_MESSAGES_LIMIT = 10
 
 
 class LLMResponse(TypedDict):
@@ -32,11 +34,18 @@ class LLMChat:
         "required": ["answer", "confidence", "intent", "data"],
     }
 
-    def __init__(self, api_url: str = API_URL, history_file: Path = HISTORY_FILE):
+    def __init__(
+        self,
+        api_url: str = API_URL,
+        history_file: Path = HISTORY_FILE,
+        summary_file: Path = SUMMARY_FILE,
+    ):
         self.api_url: str = api_url
         self.tokenize_url: str = api_url.split("/v1/", 1)[0] + "/tokenize"
         self.history_file = history_file
+        self.summary_file = summary_file
         self.conversation_history: List[Dict[str, str]] = self.load_history()
+        self.conversation_summary: str = self.load_summary()
         self.running: bool = True
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
@@ -74,6 +83,26 @@ class LLMChat:
 
         return valid_history
 
+    def load_summary(self) -> str:
+        """Загружает summary старой части диалога из отдельного файла."""
+        if not self.summary_file.exists():
+            return ""
+
+        try:
+            with self.summary_file.open("r", encoding="utf-8") as file:
+                summary_data = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить summary диалога: {e}")
+            return ""
+
+        if isinstance(summary_data, dict) and isinstance(summary_data.get("summary"), str):
+            return summary_data["summary"]
+        if isinstance(summary_data, str):
+            return summary_data
+
+        print("Файл summary имеет неверный формат, начинаем без summary")
+        return ""
+
     def save_history(self) -> None:
         """Сохраняет историю диалога в файл."""
         try:
@@ -86,6 +115,23 @@ class LLMChat:
                 )
         except OSError as e:
             print(f"Не удалось сохранить историю диалога: {e}")
+
+    def save_summary(self) -> None:
+        """Сохраняет summary старой части диалога в отдельный файл."""
+        try:
+            with self.summary_file.open("w", encoding="utf-8") as file:
+                json.dump(
+                    {"summary": self.conversation_summary},
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError as e:
+            print(f"Не удалось сохранить summary диалога: {e}")
+
+    def save_conversation_state(self) -> None:
+        self.save_history()
+        self.save_summary()
 
     def count_text_tokens(self, text: str) -> int:
         """Считает токены через локальный сервер, при недоступности использует оценку."""
@@ -111,12 +157,15 @@ class LLMChat:
         return max(1, len(text) // 3)
 
     def count_history_tokens(self) -> int:
-        """Считает токены всей сохраненной истории диалога."""
+        """Считает токены сохраненного контекста: summary + последние сообщения."""
         history_text = "\n".join(
             f"{message['role']}: {message['content']}"
             for message in self.conversation_history
         )
-        return self.count_text_tokens(history_text)
+        full_context = "\n".join(
+            part for part in [self.conversation_summary, history_text] if part
+        )
+        return self.count_text_tokens(full_context)
 
     def build_token_counts(self, current_request: str, model_response: str) -> Dict[str, int]:
         return {
@@ -128,8 +177,74 @@ class LLMChat:
     def print_token_counts(self, counts: Dict[str, int]) -> None:
         print("Токены:")
         print(f"   Текущий запрос: {counts['current_request']}")
-        print(f"   Вся история диалога: {counts['history']}")
+        print(f"   Контекст диалога: {counts['history']}")
         print(f"   Ответ модели: {counts['model_response']}")
+
+    def build_context_messages(self) -> List[Dict[str, str]]:
+        """Возвращает summary старой истории и последние сообщения как контекст."""
+        context_messages: List[Dict[str, str]] = []
+        if self.conversation_summary:
+            context_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Краткое summary предыдущей части диалога. "
+                        "Используй его как контекст, но не пересказывай без необходимости:\n"
+                        f"{self.conversation_summary}"
+                    ),
+                }
+            )
+        context_messages.extend(self.conversation_history[-RECENT_MESSAGES_LIMIT:])
+        return context_messages
+
+    def compact_history_if_needed(self) -> None:
+        """Сжимает старые сообщения в summary, оставляя последние 10 как есть."""
+        if len(self.conversation_history) <= RECENT_MESSAGES_LIMIT:
+            return
+
+        old_messages = self.conversation_history[:-RECENT_MESSAGES_LIMIT]
+        recent_messages = self.conversation_history[-RECENT_MESSAGES_LIMIT:]
+        old_dialogue = "\n".join(
+            f"{message['role']}: {message['content']}" for message in old_messages
+        )
+
+        system_prompt = (
+            "Ты сжимаешь историю диалога в полезное summary для будущих ответов. "
+            "Сохрани факты, договоренности, предпочтения пользователя, важные вопросы, "
+            "ответы ассистента и незавершенные задачи. Пиши кратко, но не теряй смысл."
+        )
+        user_prompt = (
+            "Обнови summary диалога.\n\n"
+            f"Текущее summary:\n{self.conversation_summary or '(пока нет)'}\n\n"
+            f"Новые старые сообщения, которые нужно добавить в summary:\n{old_dialogue}\n\n"
+            "Верни только обновленное summary без markdown."
+        )
+
+        payload: Dict[str, Any] = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.2,
+        }
+
+        try:
+            response = requests.post(self.api_url, json=payload, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            summary = result["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"Не удалось обновить summary, история пока не сжата: {e}")
+            return
+
+        if not summary:
+            print("Модель вернула пустое summary, история пока не сжата")
+            return
+
+        self.conversation_summary = summary
+        self.conversation_history = recent_messages
+        self.save_conversation_state()
 
     def print_last_token_counts(self) -> None:
         if self.last_token_counts is not None:
@@ -224,10 +339,11 @@ class LLMChat:
         )
 
         self.conversation_history.append({"role": "user", "content": message})
+        self.compact_history_if_needed()
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
-            + self.conversation_history[:-1]
+            + self.build_context_messages()[:-1]
             + [{"role": "user", "content": user_message}],
             "max_tokens": 50000,
             "temperature": temperature,
@@ -271,8 +387,9 @@ class LLMChat:
                     "content": json.dumps(parsed_json, ensure_ascii=False),
                 }
             )
+            self.compact_history_if_needed()
             self.last_token_counts = self.build_token_counts(message, raw_response)
-            self.save_history()
+            self.save_conversation_state()
 
             return parsed_json
 
@@ -299,10 +416,11 @@ class LLMChat:
         """Отправляет сообщение с потоковой передачей ответа, показывает время и токены."""
 
         self.conversation_history.append({"role": "user", "content": message})
+        self.compact_history_if_needed()
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
-            + self.conversation_history,
+            + self.build_context_messages(),
             "max_tokens": 50000,
             "temperature": temperature,
             "stream": True,
@@ -338,8 +456,9 @@ class LLMChat:
             print()
 
             self.conversation_history.append({"role": "assistant", "content": full_response})
+            self.compact_history_if_needed()
             token_counts = self.build_token_counts(message, full_response)
-            self.save_history()
+            self.save_conversation_state()
 
             print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
             self.print_token_counts(token_counts)
@@ -354,10 +473,11 @@ class LLMChat:
     ) -> Optional[str]:
         """Отправляет сообщение без потокового вывода, показывает время и токены"""
         self.conversation_history.append({"role": "user", "content": message})
+        self.compact_history_if_needed()
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
-            + self.conversation_history,
+            + self.build_context_messages(),
             "max_tokens": 50000,
             "temperature": temperature,
         }
@@ -375,8 +495,9 @@ class LLMChat:
             print(f"\nАссистент: {assistant_message}")
 
             self.conversation_history.append({"role": "assistant", "content": assistant_message})
+            self.compact_history_if_needed()
             token_counts = self.build_token_counts(message, assistant_message)
-            self.save_history()
+            self.save_conversation_state()
 
             print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
             self.print_token_counts(token_counts)
@@ -395,10 +516,12 @@ class LLMChat:
 
     def clear_history(self) -> None:
         self.conversation_history = []
+        self.conversation_summary = ""
         try:
             self.history_file.unlink(missing_ok=True)
+            self.summary_file.unlink(missing_ok=True)
         except OSError as e:
-            print(f"История очищена в памяти, но файл удалить не удалось: {e}")
+            print(f"История очищена в памяти, но файлы удалить не удалось: {e}")
             return
         print("История диалога очищена")
 
@@ -415,12 +538,20 @@ class LLMChat:
         print("=" * 50 + "\n")
 
     def show_history(self) -> None:
-        if not self.conversation_history:
+        if not self.conversation_summary and not self.conversation_history:
             print("\nИстория пуста\n")
             return
         print("\n" + "=" * 50)
         print("ИСТОРИЯ ДИАЛОГА:")
         print("=" * 50)
+        if self.conversation_summary:
+            summary_preview = self.conversation_summary[:500]
+            if len(self.conversation_summary) > 500:
+                summary_preview += "..."
+            print("SUMMARY СТАРЫХ СООБЩЕНИЙ:")
+            print(summary_preview)
+            print("-" * 50)
+        print(f"ПОСЛЕДНИЕ СООБЩЕНИЯ (до {RECENT_MESSAGES_LIMIT}):")
         for i, msg in enumerate(self.conversation_history, 1):
             role_label = "Пользователь" if msg["role"] == "user" else "Ассистент"
             content_preview = msg["content"][:100]
