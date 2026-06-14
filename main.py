@@ -1,17 +1,43 @@
 #!/usr/bin/env python3
-import requests
 import json
+import os
+import sys
 import time
 from pathlib import Path
 from threading import Thread
 from typing import List, Dict, Optional, Any, TypedDict, Literal
+
+
+PROJECT_VENV = Path(__file__).with_name("venv312")
+PROJECT_VENV_PYTHON = PROJECT_VENV / "bin" / "python"
+
+if (
+    os.environ.get("AI_ADVENT_SKIP_VENV") != "1"
+    and PROJECT_VENV_PYTHON.exists()
+    and Path(sys.executable).resolve() != PROJECT_VENV_PYTHON.resolve()
+):
+    os.environ["VIRTUAL_ENV"] = str(PROJECT_VENV)
+    os.environ["PATH"] = f"{PROJECT_VENV / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+    os.execv(str(PROJECT_VENV_PYTHON), [str(PROJECT_VENV_PYTHON), *sys.argv])
+
+import requests
 from jsonschema import validate, ValidationError
 
 API_URL = "http://localhost:8080/v1/chat/completions"
 DEFAULT_TEMPERATURE = 0.7
 HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
 SUMMARY_FILE = Path(__file__).with_name("conversation_summary.json")
+FACTS_FILE = Path(__file__).with_name("conversation_facts.json")
+BRANCHES_FILE = Path(__file__).with_name("conversation_branches.json")
 RECENT_MESSAGES_LIMIT = 10
+CONTEXT_STRATEGY_RECENT = "recent"
+CONTEXT_STRATEGY_FACTS = "facts"
+CONTEXT_STRATEGY_BRANCHES = "branches"
+CONTEXT_STRATEGIES = {
+    CONTEXT_STRATEGY_RECENT,
+    CONTEXT_STRATEGY_FACTS,
+    CONTEXT_STRATEGY_BRANCHES,
+}
 
 
 class LLMResponse(TypedDict):
@@ -39,16 +65,31 @@ class LLMChat:
         api_url: str = API_URL,
         history_file: Path = HISTORY_FILE,
         summary_file: Path = SUMMARY_FILE,
+        facts_file: Path = FACTS_FILE,
+        branches_file: Path = BRANCHES_FILE,
+        context_strategy: str = CONTEXT_STRATEGY_RECENT,
     ):
         self.api_url: str = api_url
         self.tokenize_url: str = api_url.split("/v1/", 1)[0] + "/tokenize"
         self.history_file = history_file
         self.summary_file = summary_file
+        self.facts_file = facts_file
+        self.branches_file = branches_file
+        self.context_strategy = (
+            context_strategy
+            if context_strategy in CONTEXT_STRATEGIES
+            else CONTEXT_STRATEGY_RECENT
+        )
         self.conversation_history: List[Dict[str, str]] = self.load_history()
         self.conversation_summary: str = self.load_summary()
+        self.facts: Dict[str, str] = self.load_facts()
+        branch_state = self.load_branches()
+        self.branches: Dict[str, List[Dict[str, str]]] = branch_state["branches"]
+        self.current_branch: Optional[str] = branch_state["current_branch"]
         self.running: bool = True
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
+        self.trim_active_history_if_needed()
 
     def load_history(self) -> List[Dict[str, str]]:
         """Загружает историю диалога из файла между запусками."""
@@ -103,6 +144,63 @@ class LLMChat:
         print("Файл summary имеет неверный формат, начинаем без summary")
         return ""
 
+    def load_facts(self) -> Dict[str, str]:
+        """Загружает facts из файла."""
+        if not self.facts_file.exists():
+            return {}
+
+        try:
+            with self.facts_file.open("r", encoding="utf-8") as file:
+                facts = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить facts: {e}")
+            return {}
+
+        if not isinstance(facts, dict):
+            print("Файл facts имеет неверный формат, начинаем без facts")
+            return {}
+
+        return {str(key): str(value) for key, value in facts.items()}
+
+    def load_branches(self) -> Dict[str, Any]:
+        """Загружает состояние веток диалога."""
+        empty_state = {"current_branch": None, "branches": {}}
+        if not self.branches_file.exists():
+            return empty_state
+
+        try:
+            with self.branches_file.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить ветки диалога: {e}")
+            return empty_state
+
+        if not isinstance(state, dict) or not isinstance(state.get("branches"), dict):
+            print("Файл веток имеет неверный формат, начинаем без веток")
+            return empty_state
+
+        branches: Dict[str, List[Dict[str, str]]] = {}
+        for name, history in state["branches"].items():
+            if not isinstance(name, str) or not isinstance(history, list):
+                continue
+            valid_history: List[Dict[str, str]] = []
+            for message in history:
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") in {"user", "assistant"}
+                    and isinstance(message.get("content"), str)
+                ):
+                    valid_history.append(
+                        {"role": message["role"], "content": message["content"]}
+                    )
+            branches[name] = valid_history
+
+        current_branch = state.get("current_branch")
+        if not isinstance(current_branch, str) or current_branch not in branches:
+            current_branch = next(iter(branches), None)
+
+        return {"current_branch": current_branch, "branches": branches}
+
     def save_history(self) -> None:
         """Сохраняет историю диалога в файл."""
         try:
@@ -129,9 +227,54 @@ class LLMChat:
         except OSError as e:
             print(f"Не удалось сохранить summary диалога: {e}")
 
+    def save_facts(self) -> None:
+        """Сохраняет facts в файл."""
+        try:
+            with self.facts_file.open("w", encoding="utf-8") as file:
+                json.dump(self.facts, file, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"Не удалось сохранить facts: {e}")
+
+    def save_branches(self) -> None:
+        """Сохраняет ветки диалога в файл."""
+        try:
+            with self.branches_file.open("w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "current_branch": self.current_branch,
+                        "branches": self.branches,
+                    },
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError as e:
+            print(f"Не удалось сохранить ветки диалога: {e}")
+
     def save_conversation_state(self) -> None:
         self.save_history()
         self.save_summary()
+        self.save_facts()
+        self.save_branches()
+
+    def get_active_history(self) -> List[Dict[str, str]]:
+        if (
+            self.context_strategy == CONTEXT_STRATEGY_BRANCHES
+            and self.current_branch
+            and self.current_branch in self.branches
+        ):
+            return self.branches[self.current_branch]
+        return self.conversation_history
+
+    def append_message(self, role: str, content: str) -> None:
+        self.get_active_history().append({"role": role, "content": content})
+
+    def trim_active_history_if_needed(self) -> None:
+        if self.context_strategy not in {CONTEXT_STRATEGY_RECENT, CONTEXT_STRATEGY_FACTS}:
+            return
+        active_history = self.get_active_history()
+        if len(active_history) > RECENT_MESSAGES_LIMIT:
+            del active_history[:-RECENT_MESSAGES_LIMIT]
 
     def count_text_tokens(self, text: str) -> int:
         """Считает токены через локальный сервер, при недоступности использует оценку."""
@@ -157,14 +300,16 @@ class LLMChat:
         return max(1, len(text) // 3)
 
     def count_history_tokens(self) -> int:
-        """Считает токены сохраненного контекста: summary + последние сообщения."""
-        history_text = "\n".join(
-            f"{message['role']}: {message['content']}"
-            for message in self.conversation_history
+        """Считает токены контекста, который отправляется модели."""
+        active_history = self.get_active_history()
+        messages_for_context = (
+            active_history
+            if self.context_strategy == CONTEXT_STRATEGY_BRANCHES
+            else active_history[-RECENT_MESSAGES_LIMIT:]
         )
-        full_context = "\n".join(
-            part for part in [self.conversation_summary, history_text] if part
-        )
+        history_text = self.format_messages(messages_for_context)
+        facts_text = json.dumps(self.facts, ensure_ascii=False) if self.facts else ""
+        full_context = "\n".join(part for part in [facts_text, history_text] if part)
         return self.count_text_tokens(full_context)
 
     def build_token_counts(self, current_request: str, model_response: str) -> Dict[str, int]:
@@ -181,70 +326,92 @@ class LLMChat:
         print(f"   Ответ модели: {counts['model_response']}")
 
     def build_context_messages(self) -> List[Dict[str, str]]:
-        """Возвращает summary старой истории и последние сообщения как контекст."""
+        """Возвращает контекст согласно выбранной стратегии памяти."""
         context_messages: List[Dict[str, str]] = []
-        if self.conversation_summary:
+        if self.context_strategy == CONTEXT_STRATEGY_FACTS and self.facts:
             context_messages.append(
                 {
                     "role": "system",
                     "content": (
-                        "Краткое summary предыдущей части диалога. "
-                        "Используй его как контекст, но не пересказывай без необходимости:\n"
-                        f"{self.conversation_summary}"
+                        "Facts - устойчивые данные из предыдущей части диалога. "
+                        "Используй их как память, но не пересказывай без необходимости:\n"
+                        f"{json.dumps(self.facts, ensure_ascii=False, indent=2)}"
                     ),
                 }
             )
-        context_messages.extend(self.conversation_history[-RECENT_MESSAGES_LIMIT:])
+        if self.context_strategy == CONTEXT_STRATEGY_BRANCHES:
+            context_messages.extend(self.get_active_history())
+        else:
+            context_messages.extend(self.get_active_history()[-RECENT_MESSAGES_LIMIT:])
         return context_messages
 
     def compact_history_if_needed(self) -> None:
-        """Сжимает старые сообщения в summary, оставляя последние 10 как есть."""
-        if len(self.conversation_history) <= RECENT_MESSAGES_LIMIT:
+        """Оставлено для совместимости со старым кодом: новые стратегии не сжимают history."""
+        return
+
+    def update_facts_from_user_message(self, message: str) -> None:
+        """Обновляет facts после каждого сообщения пользователя."""
+        if self.context_strategy != CONTEXT_STRATEGY_FACTS:
             return
 
-        old_messages = self.conversation_history[:-RECENT_MESSAGES_LIMIT]
-        recent_messages = self.conversation_history[-RECENT_MESSAGES_LIMIT:]
-        old_dialogue = "\n".join(
-            f"{message['role']}: {message['content']}" for message in old_messages
-        )
-
+        schema = {
+            "type": "object",
+            "additionalProperties": True,
+        }
         system_prompt = (
-            "Ты сжимаешь историю диалога в полезное summary для будущих ответов. "
-            "Сохрани факты, договоренности, предпочтения пользователя, важные вопросы, "
-            "ответы ассистента и незавершенные задачи. Пиши кратко, но не теряй смысл."
+            "Ты ведешь компактную долговременную память диалога в виде facts: "
+            "JSON object key-value. Обновляй только важные устойчивые данные: цель, "
+            "ограничения, предпочтения, решения, договоренности, имена, параметры, "
+            "открытые задачи и другие сведения, которые пригодятся позже. "
+            "Удаляй или заменяй устаревшие значения. Верни только JSON object."
         )
         user_prompt = (
-            "Обнови summary диалога.\n\n"
-            f"Текущее summary:\n{self.conversation_summary or '(пока нет)'}\n\n"
-            f"Новые старые сообщения, которые нужно добавить в summary:\n{old_dialogue}\n\n"
-            "Верни только обновленное summary без markdown."
+            f"Текущие facts:\n{json.dumps(self.facts, ensure_ascii=False, indent=2)}\n\n"
+            f"Последние сообщения:\n{self.format_messages(self.get_active_history()[-RECENT_MESSAGES_LIMIT:])}\n\n"
+            f"Новое сообщение пользователя:\n{message}\n\n"
+            "Верни обновленные facts как JSON object со строковыми значениями."
         )
-
         payload: Dict[str, Any] = {
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": 2000,
-            "temperature": 0.2,
+            "temperature": 0.1,
         }
 
         try:
             response = requests.post(self.api_url, json=payload, timeout=60)
             response.raise_for_status()
-            result = response.json()
-            summary = result["choices"][0]["message"]["content"].strip()
+            raw_facts = response.json()["choices"][0]["message"]["content"].strip()
+            if raw_facts.startswith("```json"):
+                raw_facts = raw_facts[7:]
+            if raw_facts.startswith("```"):
+                raw_facts = raw_facts[3:]
+            if raw_facts.endswith("```"):
+                raw_facts = raw_facts[:-3]
+            parsed_facts = json.loads(raw_facts.strip())
+            validate(instance=parsed_facts, schema=schema)
+            if not isinstance(parsed_facts, dict):
+                raise ValueError("facts должен быть JSON object")
         except Exception as e:
-            print(f"Не удалось обновить summary, история пока не сжата: {e}")
+            print(f"Не удалось обновить facts, продолжаем со старыми facts: {e}")
             return
 
-        if not summary:
-            print("Модель вернула пустое summary, история пока не сжата")
-            return
+        self.facts = {
+            str(key): (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False)
+            )
+            for key, value in parsed_facts.items()
+        }
+        self.save_facts()
 
-        self.conversation_summary = summary
-        self.conversation_history = recent_messages
-        self.save_conversation_state()
+    def format_messages(self, messages: List[Dict[str, str]]) -> str:
+        return "\n".join(
+            f"{message['role']}: {message['content']}" for message in messages
+        )
 
     def print_last_token_counts(self) -> None:
         if self.last_token_counts is not None:
@@ -338,8 +505,9 @@ class LLMChat:
             f"Вопрос: {message}\n\nВерни ответ строго в указанном JSON формате."
         )
 
-        self.conversation_history.append({"role": "user", "content": message})
-        self.compact_history_if_needed()
+        self.append_message("user", message)
+        self.trim_active_history_if_needed()
+        self.update_facts_from_user_message(message)
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
@@ -381,13 +549,11 @@ class LLMChat:
             )
             print(f"⏱️ Время ответа: {elapsed_time:.2f} сек")
 
-            self.conversation_history.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(parsed_json, ensure_ascii=False),
-                }
+            self.append_message(
+                "assistant",
+                json.dumps(parsed_json, ensure_ascii=False),
             )
-            self.compact_history_if_needed()
+            self.trim_active_history_if_needed()
             self.last_token_counts = self.build_token_counts(message, raw_response)
             self.save_conversation_state()
 
@@ -415,8 +581,9 @@ class LLMChat:
     ) -> Optional[str]:
         """Отправляет сообщение с потоковой передачей ответа, показывает время и токены."""
 
-        self.conversation_history.append({"role": "user", "content": message})
-        self.compact_history_if_needed()
+        self.append_message("user", message)
+        self.trim_active_history_if_needed()
+        self.update_facts_from_user_message(message)
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
@@ -455,8 +622,8 @@ class LLMChat:
             elapsed_time = time.time() - start_time
             print()
 
-            self.conversation_history.append({"role": "assistant", "content": full_response})
-            self.compact_history_if_needed()
+            self.append_message("assistant", full_response)
+            self.trim_active_history_if_needed()
             token_counts = self.build_token_counts(message, full_response)
             self.save_conversation_state()
 
@@ -472,8 +639,9 @@ class LLMChat:
         self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
     ) -> Optional[str]:
         """Отправляет сообщение без потокового вывода, показывает время и токены"""
-        self.conversation_history.append({"role": "user", "content": message})
-        self.compact_history_if_needed()
+        self.append_message("user", message)
+        self.trim_active_history_if_needed()
+        self.update_facts_from_user_message(message)
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": system_prompt}]
@@ -494,8 +662,8 @@ class LLMChat:
             assistant_message: str = result["choices"][0]["message"]["content"]
             print(f"\nАссистент: {assistant_message}")
 
-            self.conversation_history.append({"role": "assistant", "content": assistant_message})
-            self.compact_history_if_needed()
+            self.append_message("assistant", assistant_message)
+            self.trim_active_history_if_needed()
             token_counts = self.build_token_counts(message, assistant_message)
             self.save_conversation_state()
 
@@ -517,13 +685,56 @@ class LLMChat:
     def clear_history(self) -> None:
         self.conversation_history = []
         self.conversation_summary = ""
+        self.facts = {}
+        self.branches = {}
+        self.current_branch = None
         try:
             self.history_file.unlink(missing_ok=True)
             self.summary_file.unlink(missing_ok=True)
+            self.facts_file.unlink(missing_ok=True)
+            self.branches_file.unlink(missing_ok=True)
         except OSError as e:
             print(f"История очищена в памяти, но файлы удалить не удалось: {e}")
             return
         print("История диалога очищена")
+
+    def create_checkpoint(self) -> None:
+        if self.context_strategy != CONTEXT_STRATEGY_BRANCHES:
+            print("Checkpoint доступен только в стратегии 3: ветки от checkpoint")
+            return
+
+        checkpoint_history = list(self.get_active_history())
+        self.branches = {
+            "branch_1": [dict(message) for message in checkpoint_history],
+            "branch_2": [dict(message) for message in checkpoint_history],
+        }
+        self.current_branch = "branch_1"
+        self.save_branches()
+        print("Checkpoint создан. Доступны branch_1 и branch_2, активна branch_1")
+
+    def switch_branch(self, branch_name: str) -> None:
+        if self.context_strategy != CONTEXT_STRATEGY_BRANCHES:
+            print("Переключение веток доступно только в стратегии 3")
+            return
+        if branch_name not in self.branches:
+            print(f"Ветка '{branch_name}' не найдена. Используйте /branches")
+            return
+        self.current_branch = branch_name
+        self.save_branches()
+        print(f"Активная ветка: {branch_name}")
+
+    def show_branches(self) -> None:
+        if self.context_strategy != CONTEXT_STRATEGY_BRANCHES:
+            print("Ветки доступны только в стратегии 3")
+            return
+        if not self.branches:
+            print("Веток пока нет. Создайте checkpoint командой /checkpoint")
+            return
+        print("\nВетки:")
+        for name, history in self.branches.items():
+            marker = "*" if name == self.current_branch else " "
+            print(f" {marker} {name}: сообщений {len(history)}")
+        print()
 
     def show_help(self) -> None:
         print("\n" + "=" * 50)
@@ -533,26 +744,34 @@ class LLMChat:
         print("  /status  - Проверить статус сервера")
         print("  /json    - Режим JSON ответов")
         print("  /normal  - Обычный режим ответов")
+        print("  /facts   - Показать facts (стратегия 2)")
+        print("  /checkpoint       - Создать две ветки от текущего диалога (стратегия 3)")
+        print("  /branches         - Показать ветки (стратегия 3)")
+        print("  /branch <name>    - Переключиться на ветку (стратегия 3)")
         print("  /help    - Показать эту справку")
         print("  /exit    - Выйти из программы")
         print("=" * 50 + "\n")
 
     def show_history(self) -> None:
-        if not self.conversation_summary and not self.conversation_history:
+        active_history = self.get_active_history()
+        if not self.facts and not active_history:
             print("\nИстория пуста\n")
             return
         print("\n" + "=" * 50)
         print("ИСТОРИЯ ДИАЛОГА:")
         print("=" * 50)
-        if self.conversation_summary:
-            summary_preview = self.conversation_summary[:500]
-            if len(self.conversation_summary) > 500:
-                summary_preview += "..."
-            print("SUMMARY СТАРЫХ СООБЩЕНИЙ:")
-            print(summary_preview)
+        print(f"Стратегия контекста: {self.context_strategy}")
+        if self.current_branch:
+            print(f"Активная ветка: {self.current_branch}")
+        if self.facts:
+            facts_preview = json.dumps(self.facts, ensure_ascii=False, indent=2)[:1000]
+            if len(facts_preview) == 1000:
+                facts_preview += "..."
+            print("FACTS:")
+            print(facts_preview)
             print("-" * 50)
         print(f"ПОСЛЕДНИЕ СООБЩЕНИЯ (до {RECENT_MESSAGES_LIMIT}):")
-        for i, msg in enumerate(self.conversation_history, 1):
+        for i, msg in enumerate(active_history[-RECENT_MESSAGES_LIMIT:], 1):
             role_label = "Пользователь" if msg["role"] == "user" else "Ассистент"
             content_preview = msg["content"][:100]
             if len(msg["content"]) > 100:
@@ -581,6 +800,14 @@ class LLMChat:
             print("   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
         print()
 
+    def show_facts(self) -> None:
+        if not self.facts:
+            print("\nFacts пусты\n")
+            return
+        print("\nFACTS:")
+        print(json.dumps(self.facts, ensure_ascii=False, indent=2))
+        print()
+
     def run(self, use_streaming: bool = False, use_json_mode: bool = False) -> None:
         print("\n" + "=" * 50)
         print("ДОБРО ПОЖАЛОВАТЬ В ЧАТ С LOCAL LLM")
@@ -588,10 +815,14 @@ class LLMChat:
         print(f"Модель: Qwen3-4B-Instruct (локальная)")
         print(f"Режим: {'потоковый' if use_streaming else 'обычный'}")
         print(f"Формат ответа: {'JSON' if use_json_mode else 'текстовый'}")
+        print(f"Стратегия контекста: {self.context_strategy}")
         print("Введите /help для списка команд")
         print(f"Файл истории: {self.history_file}")
-        if self.conversation_history:
-            print(f"Загружено сообщений из истории: {len(self.conversation_history)}")
+        active_history = self.get_active_history()
+        if active_history:
+            print(f"Загружено сообщений из истории: {len(active_history)}")
+        if self.current_branch:
+            print(f"Активная ветка: {self.current_branch}")
         print("=" * 50 + "\n")
 
         if not self.check_server():
@@ -622,6 +853,18 @@ class LLMChat:
                     continue
                 elif user_input == "/status":
                     self.check_status()
+                    continue
+                elif user_input == "/facts":
+                    self.show_facts()
+                    continue
+                elif user_input == "/checkpoint":
+                    self.create_checkpoint()
+                    continue
+                elif user_input == "/branches":
+                    self.show_branches()
+                    continue
+                elif user_input.startswith("/branch "):
+                    self.switch_branch(user_input.split(maxsplit=1)[1].strip())
                     continue
                 elif user_input == "/json":
                     use_json_mode = True
@@ -663,7 +906,6 @@ class LLMChat:
 
 
 def main() -> None:
-    chat = LLMChat()
     print("Выберите режим работы:")
     print("1. Обычный режим (модель думает, затем выдает полный ответ)")
     print("2. Потоковый режим (ответ появляется по словам в реальном времени)")
@@ -674,6 +916,20 @@ def main() -> None:
     use_streaming = choice == "2"
     use_json_mode = choice == "3"
 
+    print("\nВыберите стратегию контекста и памяти:")
+    print("1. Только последние 10 сообщений")
+    print("2. Facts key-value + последние 10 сообщений")
+    print("3. Checkpoint и две независимые ветки диалога")
+
+    strategy_choice = input("\nВаш выбор (1/2/3): ").strip()
+    strategy_by_choice = {
+        "1": CONTEXT_STRATEGY_RECENT,
+        "2": CONTEXT_STRATEGY_FACTS,
+        "3": CONTEXT_STRATEGY_BRANCHES,
+    }
+    context_strategy = strategy_by_choice.get(strategy_choice, CONTEXT_STRATEGY_RECENT)
+
+    chat = LLMChat(context_strategy=context_strategy)
     chat.run(use_streaming=use_streaming, use_json_mode=use_json_mode)
 
 

@@ -2,7 +2,7 @@
 
 # Переменные для удобства (измените пути, если нужно)
 PROJECT_DIR=~/code/AI_advent
-VENV_DIR="$PROJECT_DIR/venv"
+VENV_DIR="$PROJECT_DIR/venv312"
 MODELS_DIR=~/code/models
 
 # --- НАСТРОЙКИ МОДЕЛЕЙ ---
@@ -38,6 +38,40 @@ ensure_hf_installed() {
     fi
 }
 
+# --- ФУНКЦИЯ ПРОВЕРКИ GPU ---
+check_gpu_ready() {
+    echo ""
+    echo "=== Проверка GPU ==="
+
+    if ! command -v nvidia-smi &> /dev/null; then
+        echo "nvidia-smi не найден: NVIDIA драйвер/утилиты не установлены или не в PATH."
+        echo "В таком состоянии llama.cpp не сможет использовать NVIDIA GPU."
+    elif ! nvidia-smi &> /dev/null; then
+        echo "nvidia-smi найден, но не может связаться с NVIDIA driver."
+        echo "Проверьте установку/загрузку драйвера. Пока это не исправлено, будет CPU."
+    else
+        nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+    fi
+
+    if python3 - <<'PY' 2>/dev/null
+from pathlib import Path
+import llama_cpp
+
+package_dir = Path(llama_cpp.__file__).resolve().parent
+cuda_libs = list(package_dir.glob("lib/*cuda*.so")) + list(package_dir.glob("lib/*cublas*.so"))
+raise SystemExit(0 if cuda_libs else 1)
+PY
+    then
+        echo "llama_cpp: CUDA backend найден."
+    else
+        echo "llama_cpp: CUDA backend не найден, текущая установка похожа на CPU-only."
+        echo "Для GPU переустановите llama-cpp-python внутри venv с GGML_CUDA=on."
+    fi
+
+    echo "===================="
+    echo ""
+}
+
 # --- ФУНКЦИЯ ПОКАЗА ДОСТУПНЫХ GGUF ФАЙЛОВ ---
 show_available_files() {
     local repo=$1
@@ -68,6 +102,7 @@ source "$VENV_DIR/bin/activate"
 
 # Убеждаемся, что huggingface_hub установлен
 ensure_hf_installed
+check_gpu_ready
 
 REPO="${MODEL_REPOS[$MODEL_TYPE]}"
 FILE="${MODEL_FILES[$MODEL_TYPE]}"
