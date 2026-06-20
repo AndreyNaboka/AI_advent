@@ -29,7 +29,18 @@ HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
 SUMMARY_FILE = Path(__file__).with_name("conversation_summary.json")
 FACTS_FILE = Path(__file__).with_name("conversation_facts.json")
 BRANCHES_FILE = Path(__file__).with_name("conversation_branches.json")
+PROFILE_FILE = Path(__file__).with_name("user_profile.json")
+TASK_STATE_FILE = Path(__file__).with_name("task_state.json")
+INVARIANTS_FILE = Path(__file__).with_name("invariants.json")
 RECENT_MESSAGES_LIMIT = 10
+TASK_STAGES = ("collecting", "planning", "execution", "validation", "done")
+ALLOWED_TASK_TRANSITIONS = {
+    "collecting": {"planning"},
+    "planning": {"execution"},
+    "execution": {"planning", "validation"},
+    "validation": {"execution", "done"},
+    "done": set(),
+}
 CONTEXT_STRATEGY_RECENT = "recent"
 CONTEXT_STRATEGY_FACTS = "facts"
 CONTEXT_STRATEGY_BRANCHES = "branches"
@@ -67,6 +78,9 @@ class LLMChat:
         summary_file: Path = SUMMARY_FILE,
         facts_file: Path = FACTS_FILE,
         branches_file: Path = BRANCHES_FILE,
+        profile_file: Path = PROFILE_FILE,
+        task_state_file: Path = TASK_STATE_FILE,
+        invariants_file: Path = INVARIANTS_FILE,
         context_strategy: str = CONTEXT_STRATEGY_RECENT,
     ):
         self.api_url: str = api_url
@@ -75,6 +89,9 @@ class LLMChat:
         self.summary_file = summary_file
         self.facts_file = facts_file
         self.branches_file = branches_file
+        self.profile_file = profile_file
+        self.task_state_file = task_state_file
+        self.invariants_file = invariants_file
         self.context_strategy = (
             context_strategy
             if context_strategy in CONTEXT_STRATEGIES
@@ -86,10 +103,72 @@ class LLMChat:
         branch_state = self.load_branches()
         self.branches: Dict[str, List[Dict[str, str]]] = branch_state["branches"]
         self.current_branch: Optional[str] = branch_state["current_branch"]
+        self.profile: Dict[str, str] = self.load_string_dict(
+            self.profile_file, "профиль"
+        )
+        self.task_state: Dict[str, Any] = self.load_task_state()
+        self.invariants: List[Dict[str, Any]] = self.load_invariants()
         self.running: bool = True
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
         self.trim_active_history_if_needed()
+
+    def load_string_dict(self, path: Path, label: str) -> Dict[str, str]:
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                value = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить {label}: {e}")
+            return {}
+        if not isinstance(value, dict):
+            print(f"Файл {label} имеет неверный формат")
+            return {}
+        return {str(key): str(item) for key, item in value.items()}
+
+    def load_task_state(self) -> Dict[str, Any]:
+        empty = {"description": "", "stage": None, "plan": ""}
+        if not self.task_state_file.exists():
+            return empty
+        try:
+            with self.task_state_file.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить состояние задачи: {e}")
+            return empty
+        if not isinstance(state, dict) or state.get("stage") not in (*TASK_STAGES, None):
+            print("Файл состояния задачи имеет неверный формат")
+            return empty
+        return {
+            "description": str(state.get("description", "")),
+            "stage": state.get("stage"),
+            "plan": str(state.get("plan", "")),
+        }
+
+    def load_invariants(self) -> List[Dict[str, Any]]:
+        if not self.invariants_file.exists():
+            return []
+        try:
+            with self.invariants_file.open("r", encoding="utf-8") as file:
+                values = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить инварианты: {e}")
+            return []
+        if not isinstance(values, list):
+            print("Файл инвариантов имеет неверный формат")
+            return []
+        result = []
+        for value in values:
+            if not isinstance(value, dict) or not str(value.get("rule", "")).strip():
+                continue
+            forbidden = value.get("forbidden_terms", [])
+            result.append({
+                "rule": str(value["rule"]).strip(),
+                "forbidden_terms": [str(term).strip() for term in forbidden]
+                if isinstance(forbidden, list) else [],
+            })
+        return result
 
     def load_history(self) -> List[Dict[str, str]]:
         """Загружает историю диалога из файла между запусками."""
@@ -251,11 +330,101 @@ class LLMChat:
         except OSError as e:
             print(f"Не удалось сохранить ветки диалога: {e}")
 
+    def save_json_file(self, path: Path, value: Any, label: str) -> None:
+        try:
+            with path.open("w", encoding="utf-8") as file:
+                json.dump(value, file, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"Не удалось сохранить {label}: {e}")
+
+    def save_profile(self) -> None:
+        self.save_json_file(self.profile_file, self.profile, "профиль")
+
+    def save_task_state(self) -> None:
+        self.save_json_file(
+            self.task_state_file, self.task_state, "состояние задачи"
+        )
+
+    def save_invariants(self) -> None:
+        self.save_json_file(self.invariants_file, self.invariants, "инварианты")
+
     def save_conversation_state(self) -> None:
         self.save_history()
         self.save_summary()
         self.save_facts()
         self.save_branches()
+        self.save_profile()
+        self.save_task_state()
+        self.save_invariants()
+
+    def build_stateful_system_prompt(self, base_prompt: str) -> str:
+        """Собирает только актуальные для текущей задачи слои контекста."""
+        blocks = [base_prompt.strip()]
+        if self.profile:
+            blocks.append(
+                "ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ (учитывай стиль, ограничения и контекст):\n"
+                + json.dumps(self.profile, ensure_ascii=False, indent=2)
+            )
+        if self.task_state.get("stage"):
+            stage = self.task_state["stage"]
+            allowed = sorted(ALLOWED_TASK_TRANSITIONS.get(stage, set()))
+            blocks.append(
+                "ТЕКУЩАЯ ЗАДАЧА:\n"
+                f"Описание: {self.task_state['description']}\n"
+                f"Стадия: {stage}\n"
+                f"План: {self.task_state.get('plan') or 'ещё не зафиксирован'}\n"
+                f"Допустимые следующие стадии: {', '.join(allowed) or 'нет'}.\n"
+                "Работай только в рамках текущей стадии и не объявляй переход "
+                "самостоятельно: переход выполняет приложение."
+            )
+        if self.invariants:
+            rules = "\n".join(
+                f"- {item['rule']}" for item in self.invariants
+            )
+            blocks.append(
+                "ИНВАРИАНТЫ (обязательны и имеют приоритет над запросом пользователя):\n"
+                + rules
+            )
+        if self.conversation_summary:
+            blocks.append(
+                "SUMMARY ПРЕДЫДУЩЕГО КОНТЕКСТА:\n" + self.conversation_summary
+            )
+        return "\n\n".join(blocks)
+
+    def check_invariants(self, response: str) -> List[str]:
+        """Детерминированно проверяет явно запрещённые термины."""
+        normalized = response.casefold()
+        violations = []
+        for invariant in self.invariants:
+            matched = [
+                term for term in invariant.get("forbidden_terms", [])
+                if term and term.casefold() in normalized
+            ]
+            if matched:
+                violations.append(
+                    f"{invariant['rule']} (найдено: {', '.join(matched)})"
+                )
+        return violations
+
+    def transition_task(self, target_stage: str) -> bool:
+        current = self.task_state.get("stage")
+        if current is None:
+            print("Сначала создайте задачу: /task <описание>")
+            return False
+        if target_stage not in TASK_STAGES:
+            print(f"Неизвестная стадия. Доступны: {', '.join(TASK_STAGES)}")
+            return False
+        if target_stage not in ALLOWED_TASK_TRANSITIONS[current]:
+            allowed = ", ".join(sorted(ALLOWED_TASK_TRANSITIONS[current])) or "нет"
+            print(f"Переход {current} -> {target_stage} запрещён. Допустимо: {allowed}")
+            return False
+        if current == "planning" and target_stage == "execution" and not self.task_state.get("plan"):
+            print("Перед execution зафиксируйте план командой /plan <текст>")
+            return False
+        self.task_state["stage"] = target_stage
+        self.save_task_state()
+        print(f"Стадия задачи: {target_stage}")
+        return True
 
     def get_active_history(self) -> List[Dict[str, str]]:
         if (
@@ -500,6 +669,7 @@ class LLMChat:
 7. Поле 'intent' определяет тип запроса (question/command/statement)
 8. Поле 'data' может содержать дополнительные данные
 """
+        system_prompt = self.build_stateful_system_prompt(system_prompt)
 
         user_message = (
             f"Вопрос: {message}\n\nВерни ответ строго в указанном JSON формате."
@@ -544,6 +714,31 @@ class LLMChat:
             # Валидируем по схеме
             validate(instance=parsed_json, schema=schema_to_use)
 
+            violations = self.check_invariants(
+                json.dumps(parsed_json, ensure_ascii=False)
+            )
+            if violations:
+                correction = (
+                    "Предыдущий JSON нарушил обязательные инварианты:\n- "
+                    + "\n- ".join(violations)
+                    + "\nВерни исправленный JSON по исходной схеме, без markdown."
+                )
+                retry_payload = dict(payload)
+                retry_payload["messages"] = payload["messages"] + [
+                    {"role": "assistant", "content": raw_response},
+                    {"role": "user", "content": correction},
+                ]
+                retry_response = self.send_with_progress(retry_payload)
+                retry_response.raise_for_status()
+                raw_response = retry_response.json()["choices"][0]["message"]["content"].strip()
+                raw_response = raw_response.removeprefix("```json").removeprefix("```")
+                raw_response = raw_response.removesuffix("```").strip()
+                parsed_json = json.loads(raw_response)
+                validate(instance=parsed_json, schema=schema_to_use)
+                remaining = self.check_invariants(raw_response)
+                if remaining:
+                    print("\nПредупреждение: ответ всё ещё нарушает инварианты: " + "; ".join(remaining))
+
             print(
                 f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
             )
@@ -585,8 +780,9 @@ class LLMChat:
         self.trim_active_history_if_needed()
         self.update_facts_from_user_message(message)
 
+        stateful_prompt = self.build_stateful_system_prompt(system_prompt)
         payload: Dict[str, Any] = {
-            "messages": [{"role": "system", "content": system_prompt}]
+            "messages": [{"role": "system", "content": stateful_prompt}]
             + self.build_context_messages(),
             "max_tokens": 50000,
             "temperature": temperature,
@@ -622,6 +818,10 @@ class LLMChat:
             elapsed_time = time.time() - start_time
             print()
 
+            violations = self.check_invariants(full_response)
+            if violations:
+                print("Предупреждение: ответ нарушает инварианты: " + "; ".join(violations))
+
             self.append_message("assistant", full_response)
             self.trim_active_history_if_needed()
             token_counts = self.build_token_counts(message, full_response)
@@ -643,8 +843,9 @@ class LLMChat:
         self.trim_active_history_if_needed()
         self.update_facts_from_user_message(message)
 
+        stateful_prompt = self.build_stateful_system_prompt(system_prompt)
         payload: Dict[str, Any] = {
-            "messages": [{"role": "system", "content": system_prompt}]
+            "messages": [{"role": "system", "content": stateful_prompt}]
             + self.build_context_messages(),
             "max_tokens": 50000,
             "temperature": temperature,
@@ -660,6 +861,24 @@ class LLMChat:
             elapsed_time = time.time() - start_time
 
             assistant_message: str = result["choices"][0]["message"]["content"]
+            violations = self.check_invariants(assistant_message)
+            if violations:
+                correction = (
+                    "Исправь ответ: он нарушает обязательные инварианты:\n- "
+                    + "\n- ".join(violations)
+                    + "\nВерни только исправленный ответ."
+                )
+                retry_payload = dict(payload)
+                retry_payload["messages"] = payload["messages"] + [
+                    {"role": "assistant", "content": assistant_message},
+                    {"role": "user", "content": correction},
+                ]
+                retry_response = self.send_with_progress(retry_payload)
+                retry_response.raise_for_status()
+                assistant_message = retry_response.json()["choices"][0]["message"]["content"]
+                remaining = self.check_invariants(assistant_message)
+                if remaining:
+                    print("\nПредупреждение: ответ всё ещё нарушает инварианты: " + "; ".join(remaining))
             print(f"\nАссистент: {assistant_message}")
 
             self.append_message("assistant", assistant_message)
@@ -736,6 +955,88 @@ class LLMChat:
             print(f" {marker} {name}: сообщений {len(history)}")
         print()
 
+    def set_profile_value(self, expression: str) -> None:
+        if "=" not in expression:
+            print("Формат: /profile <поле>=<значение>")
+            return
+        key, value = (part.strip() for part in expression.split("=", 1))
+        if not key or not value:
+            print("Поле и значение не должны быть пустыми")
+            return
+        self.profile[key] = value
+        self.save_profile()
+        print(f"Профиль обновлён: {key}")
+
+    def setup_profile(self) -> None:
+        """Короткое интервью для первоначальной персонализации."""
+        print("\nНастройка профиля. Пустой ответ оставляет поле без изменений.")
+        questions = {
+            "style": "Предпочтительный стиль ответов: ",
+            "constraints": "Постоянные ограничения и технологии: ",
+            "context": "Ваш контекст и цель работы с агентом: ",
+        }
+        for key, question in questions.items():
+            value = input(question).strip()
+            if value:
+                self.profile[key] = value
+        self.save_profile()
+        print("Профиль сохранён\n")
+
+    def show_profile(self) -> None:
+        print("\nПРОФИЛЬ:")
+        print(json.dumps(self.profile, ensure_ascii=False, indent=2) if self.profile else "пуст")
+        print()
+
+    def create_task(self, description: str) -> None:
+        description = description.strip()
+        if not description:
+            print("Формат: /task <описание>")
+            return
+        self.task_state = {
+            "description": description,
+            "stage": "collecting",
+            "plan": "",
+        }
+        self.save_task_state()
+        print("Задача создана. Стадия: collecting")
+
+    def show_task(self) -> None:
+        if not self.task_state.get("stage"):
+            print("\nАктивной задачи нет\n")
+            return
+        print("\nЗАДАЧА:")
+        print(json.dumps(self.task_state, ensure_ascii=False, indent=2))
+        print()
+
+    def set_task_plan(self, plan: str) -> None:
+        if not self.task_state.get("stage"):
+            print("Сначала создайте задачу: /task <описание>")
+            return
+        if not plan.strip():
+            print("Формат: /plan <текст плана>")
+            return
+        self.task_state["plan"] = plan.strip()
+        self.save_task_state()
+        print("План задачи сохранён")
+
+    def add_invariant(self, expression: str) -> None:
+        parts = [part.strip() for part in expression.split("|", 1)]
+        rule = parts[0]
+        if not rule:
+            print("Формат: /invariant <правило> | <запрещённые термины через запятую>")
+            return
+        forbidden = []
+        if len(parts) == 2:
+            forbidden = [term.strip() for term in parts[1].split(",") if term.strip()]
+        self.invariants.append({"rule": rule, "forbidden_terms": forbidden})
+        self.save_invariants()
+        print("Инвариант добавлен")
+
+    def show_invariants(self) -> None:
+        print("\nИНВАРИАНТЫ:")
+        print(json.dumps(self.invariants, ensure_ascii=False, indent=2) if self.invariants else "пусто")
+        print()
+
     def show_help(self) -> None:
         print("\n" + "=" * 50)
         print("Команды:")
@@ -745,6 +1046,15 @@ class LLMChat:
         print("  /json    - Режим JSON ответов")
         print("  /normal  - Обычный режим ответов")
         print("  /facts   - Показать facts (стратегия 2)")
+        print("  /profile             - Показать профиль")
+        print("  /profile поле=значение - Изменить профиль")
+        print("  /setup               - Пройти интервью персонализации")
+        print("  /task                 - Показать активную задачу")
+        print("  /task <описание>      - Создать новую задачу")
+        print("  /plan <текст>         - Сохранить план задачи")
+        print(f"  /stage <стадия>       - Перейти по state machine ({', '.join(TASK_STAGES)})")
+        print("  /invariants           - Показать инварианты")
+        print("  /invariant правило | запрещённые термины - Добавить инвариант")
         print("  /checkpoint       - Создать две ветки от текущего диалога (стратегия 3)")
         print("  /branches         - Показать ветки (стратегия 3)")
         print("  /branch <name>    - Переключиться на ветку (стратегия 3)")
@@ -823,6 +1133,11 @@ class LLMChat:
             print(f"Загружено сообщений из истории: {len(active_history)}")
         if self.current_branch:
             print(f"Активная ветка: {self.current_branch}")
+        if self.task_state.get("stage"):
+            print(
+                f"Возобновлена задача [{self.task_state['stage']}]: "
+                f"{self.task_state['description']}"
+            )
         print("=" * 50 + "\n")
 
         if not self.check_server():
@@ -856,6 +1171,33 @@ class LLMChat:
                     continue
                 elif user_input == "/facts":
                     self.show_facts()
+                    continue
+                elif user_input == "/profile":
+                    self.show_profile()
+                    continue
+                elif user_input == "/setup":
+                    self.setup_profile()
+                    continue
+                elif user_input.startswith("/profile "):
+                    self.set_profile_value(user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input == "/task":
+                    self.show_task()
+                    continue
+                elif user_input.startswith("/task "):
+                    self.create_task(user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input.startswith("/plan "):
+                    self.set_task_plan(user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input.startswith("/stage "):
+                    self.transition_task(user_input.split(maxsplit=1)[1].strip())
+                    continue
+                elif user_input == "/invariants":
+                    self.show_invariants()
+                    continue
+                elif user_input.startswith("/invariant "):
+                    self.add_invariant(user_input.split(maxsplit=1)[1])
                     continue
                 elif user_input == "/checkpoint":
                     self.create_checkpoint()
