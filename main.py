@@ -32,6 +32,7 @@ BRANCHES_FILE = Path(__file__).with_name("conversation_branches.json")
 PROFILE_FILE = Path(__file__).with_name("user_profile.json")
 TASK_STATE_FILE = Path(__file__).with_name("task_state.json")
 INVARIANTS_FILE = Path(__file__).with_name("invariants.json")
+MEMORY_FILE = Path(__file__).with_name("agent_memory.json")
 RECENT_MESSAGES_LIMIT = 10
 TASK_STAGES = ("collecting", "planning", "execution", "validation", "done")
 ALLOWED_TASK_TRANSITIONS = {
@@ -81,6 +82,7 @@ class LLMChat:
         profile_file: Path = PROFILE_FILE,
         task_state_file: Path = TASK_STATE_FILE,
         invariants_file: Path = INVARIANTS_FILE,
+        memory_file: Optional[Path] = None,
         context_strategy: str = CONTEXT_STRATEGY_RECENT,
     ):
         self.api_url: str = api_url
@@ -92,6 +94,11 @@ class LLMChat:
         self.profile_file = profile_file
         self.task_state_file = task_state_file
         self.invariants_file = invariants_file
+        self.memory_file = memory_file or (
+            MEMORY_FILE
+            if profile_file == PROFILE_FILE
+            else profile_file.with_name("agent_memory.json")
+        )
         self.context_strategy = (
             context_strategy
             if context_strategy in CONTEXT_STRATEGIES
@@ -103,29 +110,164 @@ class LLMChat:
         branch_state = self.load_branches()
         self.branches: Dict[str, List[Dict[str, str]]] = branch_state["branches"]
         self.current_branch: Optional[str] = branch_state["current_branch"]
-        self.profile: Dict[str, str] = self.load_string_dict(
-            self.profile_file, "профиль"
+        profile_state = self.load_profiles()
+        self.profiles: Dict[str, Dict[str, str]] = profile_state["profiles"]
+        self.current_user: str = profile_state["current_user"]
+        self.profile: Dict[str, str] = self.profiles.setdefault(
+            self.current_user, {}
         )
         self.task_state: Dict[str, Any] = self.load_task_state()
         self.invariants: List[Dict[str, Any]] = self.load_invariants()
+        legacy_memory = self.create_memory(
+            history=self.conversation_history,
+            summary=self.conversation_summary,
+            branches=self.branches,
+            current_branch=self.current_branch,
+            task=self.task_state,
+            knowledge=self.facts,
+            invariants=self.invariants,
+        )
+        self.memories: Dict[str, Dict[str, Any]] = self.load_memories(legacy_memory)
+        self.activate_user_memory(self.current_user, sync_current=False)
         self.running: bool = True
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
         self.trim_active_history_if_needed()
 
-    def load_string_dict(self, path: Path, label: str) -> Dict[str, str]:
-        if not path.exists():
-            return {}
+    def create_memory(
+        self,
+        history: Optional[List[Dict[str, str]]] = None,
+        summary: str = "",
+        branches: Optional[Dict[str, List[Dict[str, str]]]] = None,
+        current_branch: Optional[str] = None,
+        task: Optional[Dict[str, Any]] = None,
+        knowledge: Optional[Dict[str, str]] = None,
+        invariants: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "short_term": {
+                "history": history or [],
+                "summary": summary,
+                "branches": branches or {},
+                "current_branch": current_branch,
+            },
+            "working": {
+                "task": task or {"description": "", "stage": None, "plan": ""},
+                "notes": {},
+            },
+            "long_term": {
+                "decisions": {},
+                "knowledge": knowledge or {},
+                "invariants": invariants or [],
+            },
+        }
+
+    def load_memories(self, legacy_memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        if not self.memory_file.exists():
+            return {self.current_user: legacy_memory}
         try:
-            with path.open("r", encoding="utf-8") as file:
+            with self.memory_file.open("r", encoding="utf-8") as file:
                 value = json.load(file)
         except (OSError, json.JSONDecodeError) as e:
-            print(f"Не удалось загрузить {label}: {e}")
-            return {}
+            print(f"Не удалось загрузить память пользователей: {e}")
+            return {self.current_user: legacy_memory}
         if not isinstance(value, dict):
-            print(f"Файл {label} имеет неверный формат")
-            return {}
-        return {str(key): str(item) for key, item in value.items()}
+            print("Файл памяти пользователей имеет неверный формат")
+            return {self.current_user: legacy_memory}
+
+        memories: Dict[str, Dict[str, Any]] = {}
+        for user_id, memory in value.items():
+            if not isinstance(user_id, str) or not isinstance(memory, dict):
+                continue
+            empty = self.create_memory()
+            for layer in ("short_term", "working", "long_term"):
+                stored_layer = memory.get(layer)
+                if isinstance(stored_layer, dict):
+                    empty[layer].update(stored_layer)
+            memories[user_id] = empty
+        memories.setdefault(self.current_user, legacy_memory)
+        return memories
+
+    def sync_active_memory(self) -> None:
+        if not hasattr(self, "memories"):
+            return
+        self.memories[self.current_user] = {
+            "short_term": {
+                "history": self.conversation_history,
+                "summary": self.conversation_summary,
+                "branches": self.branches,
+                "current_branch": self.current_branch,
+            },
+            "working": {"task": self.task_state, "notes": self.working_notes},
+            "long_term": {
+                "decisions": self.decisions,
+                "knowledge": self.facts,
+                "invariants": self.invariants,
+            },
+        }
+
+    def activate_user_memory(self, user_id: str, sync_current: bool = True) -> None:
+        if sync_current:
+            self.sync_active_memory()
+        memory = self.memories.setdefault(user_id, self.create_memory())
+        short_term = memory["short_term"]
+        working = memory["working"]
+        long_term = memory["long_term"]
+        self.conversation_history = short_term["history"]
+        self.conversation_summary = str(short_term.get("summary", ""))
+        self.branches = short_term["branches"]
+        self.current_branch = short_term.get("current_branch")
+        self.task_state = working["task"]
+        self.working_notes: Dict[str, str] = working["notes"]
+        self.decisions: Dict[str, str] = long_term["decisions"]
+        self.facts = long_term["knowledge"]
+        self.invariants = long_term["invariants"]
+
+    def save_memories(self) -> None:
+        self.sync_active_memory()
+        self.save_json_file(self.memory_file, self.memories, "память пользователей")
+
+    def load_profiles(self) -> Dict[str, Any]:
+        empty = {"current_user": "default", "profiles": {"default": {}}}
+        if not self.profile_file.exists():
+            return empty
+        try:
+            with self.profile_file.open("r", encoding="utf-8") as file:
+                value = json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Не удалось загрузить профили: {e}")
+            return empty
+        if not isinstance(value, dict):
+            print("Файл профилей имеет неверный формат")
+            return empty
+
+        # Миграция старого формата: {"style": "...", "context": "..."}.
+        if "profiles" not in value:
+            legacy_profile = {
+                str(key): str(item) for key, item in value.items()
+            }
+            return {
+                "current_user": "default",
+                "profiles": {"default": legacy_profile},
+            }
+
+        raw_profiles = value.get("profiles")
+        if not isinstance(raw_profiles, dict):
+            print("Файл профилей имеет неверный формат")
+            return empty
+        profiles: Dict[str, Dict[str, str]] = {}
+        for user_id, profile in raw_profiles.items():
+            if not isinstance(user_id, str) or not isinstance(profile, dict):
+                continue
+            profiles[user_id] = {
+                str(key): str(item) for key, item in profile.items()
+            }
+        if not profiles:
+            profiles = {"default": {}}
+        current_user = value.get("current_user")
+        if not isinstance(current_user, str) or current_user not in profiles:
+            current_user = next(iter(profiles))
+        return {"current_user": current_user, "profiles": profiles}
 
     def load_task_state(self) -> Dict[str, Any]:
         empty = {"description": "", "stage": None, "plan": ""}
@@ -281,54 +423,18 @@ class LLMChat:
         return {"current_branch": current_branch, "branches": branches}
 
     def save_history(self) -> None:
-        """Сохраняет историю диалога в файл."""
-        try:
-            with self.history_file.open("w", encoding="utf-8") as file:
-                json.dump(
-                    self.conversation_history,
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except OSError as e:
-            print(f"Не удалось сохранить историю диалога: {e}")
+        """Сохраняет краткосрочную память активного пользователя."""
+        self.save_memories()
 
     def save_summary(self) -> None:
-        """Сохраняет summary старой части диалога в отдельный файл."""
-        try:
-            with self.summary_file.open("w", encoding="utf-8") as file:
-                json.dump(
-                    {"summary": self.conversation_summary},
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except OSError as e:
-            print(f"Не удалось сохранить summary диалога: {e}")
+        self.save_memories()
 
     def save_facts(self) -> None:
-        """Сохраняет facts в файл."""
-        try:
-            with self.facts_file.open("w", encoding="utf-8") as file:
-                json.dump(self.facts, file, ensure_ascii=False, indent=2)
-        except OSError as e:
-            print(f"Не удалось сохранить facts: {e}")
+        """Сохраняет знания в долговременную память активного пользователя."""
+        self.save_memories()
 
     def save_branches(self) -> None:
-        """Сохраняет ветки диалога в файл."""
-        try:
-            with self.branches_file.open("w", encoding="utf-8") as file:
-                json.dump(
-                    {
-                        "current_branch": self.current_branch,
-                        "branches": self.branches,
-                    },
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except OSError as e:
-            print(f"Не удалось сохранить ветки диалога: {e}")
+        self.save_memories()
 
     def save_json_file(self, path: Path, value: Any, label: str) -> None:
         try:
@@ -338,31 +444,29 @@ class LLMChat:
             print(f"Не удалось сохранить {label}: {e}")
 
     def save_profile(self) -> None:
-        self.save_json_file(self.profile_file, self.profile, "профиль")
-
-    def save_task_state(self) -> None:
         self.save_json_file(
-            self.task_state_file, self.task_state, "состояние задачи"
+            self.profile_file,
+            {"current_user": self.current_user, "profiles": self.profiles},
+            "профили",
         )
 
+    def save_task_state(self) -> None:
+        self.save_memories()
+
     def save_invariants(self) -> None:
-        self.save_json_file(self.invariants_file, self.invariants, "инварианты")
+        self.save_memories()
 
     def save_conversation_state(self) -> None:
-        self.save_history()
-        self.save_summary()
-        self.save_facts()
-        self.save_branches()
+        self.save_memories()
         self.save_profile()
-        self.save_task_state()
-        self.save_invariants()
 
     def build_stateful_system_prompt(self, base_prompt: str) -> str:
         """Собирает только актуальные для текущей задачи слои контекста."""
         blocks = [base_prompt.strip()]
         if self.profile:
             blocks.append(
-                "ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ (учитывай стиль, ограничения и контекст):\n"
+                f"ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ {self.current_user!r} "
+                "(учитывай стиль, ограничения и контекст):\n"
                 + json.dumps(self.profile, ensure_ascii=False, indent=2)
             )
         if self.task_state.get("stage"):
@@ -376,6 +480,19 @@ class LLMChat:
                 f"Допустимые следующие стадии: {', '.join(allowed) or 'нет'}.\n"
                 "Работай только в рамках текущей стадии и не объявляй переход "
                 "самостоятельно: переход выполняет приложение."
+            )
+        if self.working_notes:
+            blocks.append(
+                "РАБОЧАЯ ПАМЯТЬ ТЕКУЩЕЙ ЗАДАЧИ:\n"
+                + json.dumps(self.working_notes, ensure_ascii=False, indent=2)
+            )
+        if self.decisions or self.facts:
+            blocks.append(
+                "ДОЛГОВРЕМЕННАЯ ПАМЯТЬ ПОЛЬЗОВАТЕЛЯ:\n"
+                "Решения:\n"
+                + json.dumps(self.decisions, ensure_ascii=False, indent=2)
+                + "\nЗнания:\n"
+                + json.dumps(self.facts, ensure_ascii=False, indent=2)
             )
         if self.invariants:
             rules = "\n".join(
@@ -497,17 +614,6 @@ class LLMChat:
     def build_context_messages(self) -> List[Dict[str, str]]:
         """Возвращает контекст согласно выбранной стратегии памяти."""
         context_messages: List[Dict[str, str]] = []
-        if self.context_strategy == CONTEXT_STRATEGY_FACTS and self.facts:
-            context_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Facts - устойчивые данные из предыдущей части диалога. "
-                        "Используй их как память, но не пересказывай без необходимости:\n"
-                        f"{json.dumps(self.facts, ensure_ascii=False, indent=2)}"
-                    ),
-                }
-            )
         if self.context_strategy == CONTEXT_STRATEGY_BRANCHES:
             context_messages.extend(self.get_active_history())
         else:
@@ -902,20 +1008,13 @@ class LLMChat:
             return None
 
     def clear_history(self) -> None:
+        """Очищает только краткосрочную память активного пользователя."""
         self.conversation_history = []
         self.conversation_summary = ""
-        self.facts = {}
         self.branches = {}
         self.current_branch = None
-        try:
-            self.history_file.unlink(missing_ok=True)
-            self.summary_file.unlink(missing_ok=True)
-            self.facts_file.unlink(missing_ok=True)
-            self.branches_file.unlink(missing_ok=True)
-        except OSError as e:
-            print(f"История очищена в памяти, но файлы удалить не удалось: {e}")
-            return
-        print("История диалога очищена")
+        self.save_memories()
+        print("Краткосрочная память текущего диалога очищена")
 
     def create_checkpoint(self) -> None:
         if self.context_strategy != CONTEXT_STRATEGY_BRANCHES:
@@ -965,11 +1064,38 @@ class LLMChat:
             return
         self.profile[key] = value
         self.save_profile()
-        print(f"Профиль обновлён: {key}")
+        print(f"Профиль {self.current_user!r} обновлён: {key}")
+
+    def switch_user(self, user_id: str) -> None:
+        user_id = user_id.strip()
+        if not user_id:
+            print("Формат: /user <user_id>")
+            return
+        if len(user_id) > 100:
+            print("user_id не должен быть длиннее 100 символов")
+            return
+        created = user_id not in self.profiles
+        self.activate_user_memory(user_id)
+        self.current_user = user_id
+        self.profile = self.profiles.setdefault(user_id, {})
+        self.trim_active_history_if_needed()
+        self.save_conversation_state()
+        action = "создан и выбран" if created else "выбран"
+        print(f"Пользователь {user_id!r} {action}")
+
+    def show_users(self) -> None:
+        print("\nПОЛЬЗОВАТЕЛИ:")
+        for user_id in self.profiles:
+            marker = "*" if user_id == self.current_user else " "
+            print(f" {marker} {user_id}")
+        print()
 
     def setup_profile(self) -> None:
         """Короткое интервью для первоначальной персонализации."""
-        print("\nНастройка профиля. Пустой ответ оставляет поле без изменений.")
+        print(
+            f"\nНастройка профиля {self.current_user!r}. "
+            "Пустой ответ оставляет поле без изменений."
+        )
         questions = {
             "style": "Предпочтительный стиль ответов: ",
             "constraints": "Постоянные ограничения и технологии: ",
@@ -983,7 +1109,7 @@ class LLMChat:
         print("Профиль сохранён\n")
 
     def show_profile(self) -> None:
-        print("\nПРОФИЛЬ:")
+        print(f"\nПРОФИЛЬ {self.current_user!r}:")
         print(json.dumps(self.profile, ensure_ascii=False, indent=2) if self.profile else "пуст")
         print()
 
@@ -1019,6 +1145,70 @@ class LLMChat:
         self.save_task_state()
         print("План задачи сохранён")
 
+    def set_memory_value(self, layer: str, expression: str) -> None:
+        if "=" not in expression:
+            print(f"Формат: /{layer} <ключ>=<значение>")
+            return
+        key, value = (part.strip() for part in expression.split("=", 1))
+        if not key or not value:
+            print("Ключ и значение не должны быть пустыми")
+            return
+        targets = {
+            "work": self.working_notes,
+            "remember": self.facts,
+            "decision": self.decisions,
+        }
+        targets[layer][key] = value
+        self.save_memories()
+        print(f"Значение сохранено в слой {layer}: {key}")
+
+    def clear_working_memory(self) -> None:
+        self.task_state = {"description": "", "stage": None, "plan": ""}
+        self.working_notes = {}
+        self.save_memories()
+        print("Рабочая память текущего пользователя очищена")
+
+    def forget_memory_value(self, layer: str, key: str) -> None:
+        key = key.strip()
+        targets = {
+            "work": [self.working_notes],
+            "long": [self.facts, self.decisions],
+        }
+        removed = False
+        for target in targets[layer]:
+            if key in target:
+                del target[key]
+                removed = True
+        if not removed:
+            print(f"Ключ {key!r} в слое {layer} не найден")
+            return
+        self.save_memories()
+        print(f"Ключ {key!r} удалён из слоя {layer}")
+
+    def show_memory(self) -> None:
+        active_history = self.get_active_history()
+        view = {
+            "user": self.current_user,
+            "short_term": {
+                "messages": len(active_history),
+                "recent": active_history[-RECENT_MESSAGES_LIMIT:],
+                "current_branch": self.current_branch,
+            },
+            "working": {
+                "task": self.task_state,
+                "notes": self.working_notes,
+            },
+            "long_term": {
+                "profile": self.profile,
+                "decisions": self.decisions,
+                "knowledge": self.facts,
+                "invariants": self.invariants,
+            },
+        }
+        print("\nПАМЯТЬ АКТИВНОГО ПОЛЬЗОВАТЕЛЯ:")
+        print(json.dumps(view, ensure_ascii=False, indent=2))
+        print()
+
     def add_invariant(self, expression: str) -> None:
         parts = [part.strip() for part in expression.split("|", 1)]
         rule = parts[0]
@@ -1040,8 +1230,9 @@ class LLMChat:
     def show_help(self) -> None:
         print("\n" + "=" * 50)
         print("Команды:")
-        print("  /clear   - Очистить историю диалога")
+        print("  /clear   - Очистить только краткосрочную память")
         print("  /history - Показать историю диалога")
+        print("  /memory  - Показать все три слоя памяти")
         print("  /status  - Проверить статус сервера")
         print("  /json    - Режим JSON ответов")
         print("  /normal  - Обычный режим ответов")
@@ -1049,9 +1240,17 @@ class LLMChat:
         print("  /profile             - Показать профиль")
         print("  /profile поле=значение - Изменить профиль")
         print("  /setup               - Пройти интервью персонализации")
+        print("  /users               - Показать пользователей")
+        print("  /user <user_id>      - Создать или выбрать пользователя")
         print("  /task                 - Показать активную задачу")
         print("  /task <описание>      - Создать новую задачу")
         print("  /plan <текст>         - Сохранить план задачи")
+        print("  /work ключ=значение   - Записать данные текущей задачи")
+        print("  /work-forget ключ     - Удалить рабочую заметку")
+        print("  /work-clear           - Очистить задачу и рабочие заметки")
+        print("  /remember ключ=значение - Сохранить долгосрочное знание")
+        print("  /decision ключ=значение - Сохранить долгосрочное решение")
+        print("  /forget ключ          - Удалить знание или решение")
         print(f"  /stage <стадия>       - Перейти по state machine ({', '.join(TASK_STAGES)})")
         print("  /invariants           - Показать инварианты")
         print("  /invariant правило | запрещённые термины - Добавить инвариант")
@@ -1064,22 +1263,16 @@ class LLMChat:
 
     def show_history(self) -> None:
         active_history = self.get_active_history()
-        if not self.facts and not active_history:
+        if not active_history:
             print("\nИстория пуста\n")
             return
         print("\n" + "=" * 50)
         print("ИСТОРИЯ ДИАЛОГА:")
         print("=" * 50)
         print(f"Стратегия контекста: {self.context_strategy}")
+        print(f"Активный пользователь: {self.current_user}")
         if self.current_branch:
             print(f"Активная ветка: {self.current_branch}")
-        if self.facts:
-            facts_preview = json.dumps(self.facts, ensure_ascii=False, indent=2)[:1000]
-            if len(facts_preview) == 1000:
-                facts_preview += "..."
-            print("FACTS:")
-            print(facts_preview)
-            print("-" * 50)
         print(f"ПОСЛЕДНИЕ СООБЩЕНИЯ (до {RECENT_MESSAGES_LIMIT}):")
         for i, msg in enumerate(active_history[-RECENT_MESSAGES_LIMIT:], 1):
             role_label = "Пользователь" if msg["role"] == "user" else "Ассистент"
@@ -1112,9 +1305,9 @@ class LLMChat:
 
     def show_facts(self) -> None:
         if not self.facts:
-            print("\nFacts пусты\n")
+            print("\nДолговременные знания пусты\n")
             return
-        print("\nFACTS:")
+        print("\nДОЛГОВРЕМЕННЫЕ ЗНАНИЯ:")
         print(json.dumps(self.facts, ensure_ascii=False, indent=2))
         print()
 
@@ -1126,8 +1319,9 @@ class LLMChat:
         print(f"Режим: {'потоковый' if use_streaming else 'обычный'}")
         print(f"Формат ответа: {'JSON' if use_json_mode else 'текстовый'}")
         print(f"Стратегия контекста: {self.context_strategy}")
+        print(f"Активный пользователь: {self.current_user}")
         print("Введите /help для списка команд")
-        print(f"Файл истории: {self.history_file}")
+        print(f"Файл памяти: {self.memory_file}")
         active_history = self.get_active_history()
         if active_history:
             print(f"Загружено сообщений из истории: {len(active_history)}")
@@ -1163,6 +1357,9 @@ class LLMChat:
                 elif user_input == "/history":
                     self.show_history()
                     continue
+                elif user_input == "/memory":
+                    self.show_memory()
+                    continue
                 elif user_input == "/help":
                     self.show_help()
                     continue
@@ -1174,6 +1371,12 @@ class LLMChat:
                     continue
                 elif user_input == "/profile":
                     self.show_profile()
+                    continue
+                elif user_input == "/users":
+                    self.show_users()
+                    continue
+                elif user_input.startswith("/user "):
+                    self.switch_user(user_input.split(maxsplit=1)[1])
                     continue
                 elif user_input == "/setup":
                     self.setup_profile()
@@ -1189,6 +1392,24 @@ class LLMChat:
                     continue
                 elif user_input.startswith("/plan "):
                     self.set_task_plan(user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input.startswith("/work "):
+                    self.set_memory_value("work", user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input.startswith("/work-forget "):
+                    self.forget_memory_value("work", user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input == "/work-clear":
+                    self.clear_working_memory()
+                    continue
+                elif user_input.startswith("/remember "):
+                    self.set_memory_value("remember", user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input.startswith("/decision "):
+                    self.set_memory_value("decision", user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input.startswith("/forget "):
+                    self.forget_memory_value("long", user_input.split(maxsplit=1)[1])
                     continue
                 elif user_input.startswith("/stage "):
                     self.transition_task(user_input.split(maxsplit=1)[1].strip())

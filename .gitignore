@@ -2,3 +2,9 @@ __pycache__/
 venv/
 conversation_history.json
 conversation_summary.json
+conversation_facts.json
+conversation_branches.json
+user_profile.json
+task_state.json
+invariants.json
+agent_memory.json
