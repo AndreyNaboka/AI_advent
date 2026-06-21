@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -129,6 +130,7 @@ class LLMChat:
         )
         self.memories: Dict[str, Dict[str, Any]] = self.load_memories(legacy_memory)
         self.activate_user_memory(self.current_user, sync_current=False)
+        self.normalize_invariants()
         self.running: bool = True
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
@@ -513,8 +515,9 @@ class LLMChat:
         normalized = response.casefold()
         violations = []
         for invariant in self.invariants:
+            forbidden_terms = self.get_forbidden_terms(invariant)
             matched = [
-                term for term in invariant.get("forbidden_terms", [])
+                term for term in forbidden_terms
                 if term and term.casefold() in normalized
             ]
             if matched:
@@ -522,6 +525,54 @@ class LLMChat:
                     f"{invariant['rule']} (найдено: {', '.join(matched)})"
                 )
         return violations
+
+    def build_invariant_refusal(self, request: str) -> Optional[str]:
+        violations = self.check_invariants(request)
+        if not violations:
+            return None
+        return (
+            "Не могу выполнить запрос в указанном виде: он противоречит "
+            "обязательным инвариантам:\n- "
+            + "\n- ".join(violations)
+            + "\nСформулируйте запрос без запрещённой технологии."
+        )
+
+    def record_local_response(self, message: str, response: str) -> None:
+        """Сохраняет ответ, сформированный кодом без обращения к LLM."""
+        self.append_message("user", message)
+        self.append_message("assistant", response)
+        self.trim_active_history_if_needed()
+        self.save_conversation_state()
+
+    def infer_forbidden_terms(self, rule: str) -> List[str]:
+        """Извлекает простые запреты вида 'Python запрещён' из старых правил."""
+        technology = r"([A-Za-zА-Яа-яЁё][\w.+#-]*)"
+        patterns = (
+            rf"\b{technology}\s+запрещ(?:ен|ена|ено|ены|ён|ёна|ёно|ёны)\b",
+            rf"\bне\s+использовать\s+{technology}\b",
+            rf"\bзапрещено\s+использовать\s+{technology}\b",
+        )
+        terms: List[str] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, rule, flags=re.IGNORECASE):
+                term = match.group(1)
+                if term.casefold() not in {item.casefold() for item in terms}:
+                    terms.append(term)
+        return terms
+
+    def get_forbidden_terms(self, invariant: Dict[str, Any]) -> List[str]:
+        terms = invariant.get("forbidden_terms", [])
+        if isinstance(terms, list) and terms:
+            return [str(term).strip() for term in terms if str(term).strip()]
+        return self.infer_forbidden_terms(str(invariant.get("rule", "")))
+
+    def normalize_invariants(self) -> None:
+        """Мигрирует старые текстовые запреты в проверяемую структуру."""
+        for invariant in self.invariants:
+            if not invariant.get("forbidden_terms"):
+                invariant["forbidden_terms"] = self.infer_forbidden_terms(
+                    str(invariant.get("rule", ""))
+                )
 
     def transition_task(self, target_stage: str) -> bool:
         current = self.task_state.get("stage")
@@ -759,6 +810,23 @@ class LLMChat:
         schema_to_use = schema or self.RESPONSE_SCHEMA
         raw_response: str = ""
 
+        refusal = self.build_invariant_refusal(message)
+        if refusal:
+            parsed_json: Dict[str, Any] = {
+                "answer": refusal,
+                "confidence": 1.0,
+                "intent": "command",
+                "data": {"blocked_by_invariant": True},
+            }
+            validate(instance=parsed_json, schema=schema_to_use)
+            serialized = json.dumps(parsed_json, ensure_ascii=False)
+            self.record_local_response(message, serialized)
+            self.last_token_counts = self.build_token_counts(message, serialized)
+            print(
+                f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
+            )
+            return parsed_json
+
         system_prompt = f"""
 Ты - ассистент, который возвращает ответы строго в JSON формате.
 
@@ -843,7 +911,12 @@ class LLMChat:
                 validate(instance=parsed_json, schema=schema_to_use)
                 remaining = self.check_invariants(raw_response)
                 if remaining:
-                    print("\nПредупреждение: ответ всё ещё нарушает инварианты: " + "; ".join(remaining))
+                    print(
+                        "\nОтвет заблокирован: модель повторно нарушила инварианты: "
+                        + "; ".join(remaining)
+                    )
+                    self.save_conversation_state()
+                    return None
 
             print(
                 f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
@@ -881,6 +954,13 @@ class LLMChat:
         self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
     ) -> Optional[str]:
         """Отправляет сообщение с потоковой передачей ответа, показывает время и токены."""
+
+        if self.invariants:
+            print(
+                "Строгие инварианты активны: используется буферизованный режим, "
+                "чтобы проверить ответ до показа."
+            )
+            return self.send_message_simple(message, temperature, system_prompt)
 
         self.append_message("user", message)
         self.trim_active_history_if_needed()
@@ -945,6 +1025,14 @@ class LLMChat:
         self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
     ) -> Optional[str]:
         """Отправляет сообщение без потокового вывода, показывает время и токены"""
+        refusal = self.build_invariant_refusal(message)
+        if refusal:
+            self.record_local_response(message, refusal)
+            print(f"\nАссистент: {refusal}")
+            token_counts = self.build_token_counts(message, refusal)
+            self.print_token_counts(token_counts)
+            return refusal
+
         self.append_message("user", message)
         self.trim_active_history_if_needed()
         self.update_facts_from_user_message(message)
@@ -984,7 +1072,12 @@ class LLMChat:
                 assistant_message = retry_response.json()["choices"][0]["message"]["content"]
                 remaining = self.check_invariants(assistant_message)
                 if remaining:
-                    print("\nПредупреждение: ответ всё ещё нарушает инварианты: " + "; ".join(remaining))
+                    print(
+                        "\nОтвет заблокирован: модель повторно нарушила инварианты: "
+                        + "; ".join(remaining)
+                    )
+                    self.save_conversation_state()
+                    return None
             print(f"\nАссистент: {assistant_message}")
 
             self.append_message("assistant", assistant_message)
@@ -1076,6 +1169,7 @@ class LLMChat:
             return
         created = user_id not in self.profiles
         self.activate_user_memory(user_id)
+        self.normalize_invariants()
         self.current_user = user_id
         self.profile = self.profiles.setdefault(user_id, {})
         self.trim_active_history_if_needed()
@@ -1218,6 +1312,14 @@ class LLMChat:
         forbidden = []
         if len(parts) == 2:
             forbidden = [term.strip() for term in parts[1].split(",") if term.strip()]
+        if not forbidden:
+            forbidden = self.infer_forbidden_terms(rule)
+        if not forbidden:
+            print(
+                "Инвариант не добавлен: нельзя построить строгую проверку. "
+                "Укажите запрещённые термины после |"
+            )
+            return
         self.invariants.append({"rule": rule, "forbidden_terms": forbidden})
         self.save_invariants()
         print("Инвариант добавлен")
