@@ -23,6 +23,7 @@ if (
 
 import requests
 from jsonschema import validate, ValidationError
+from mcp_client import MCPClientError, MCPNewsClient
 
 API_URL = "http://localhost:8080/v1/chat/completions"
 DEFAULT_TEMPERATURE = 0.7
@@ -134,6 +135,7 @@ class LLMChat:
         self.running: bool = True
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
+        self.mcp_client = MCPNewsClient()
         self.trim_active_history_if_needed()
 
     def create_memory(
@@ -1359,6 +1361,10 @@ class LLMChat:
         print("  /checkpoint       - Создать две ветки от текущего диалога (стратегия 3)")
         print("  /branches         - Показать ветки (стратегия 3)")
         print("  /branch <name>    - Переключиться на ветку (стратегия 3)")
+        print("  /mcp-start        - Запустить MCP-сервер мировых новостей")
+        print("  /mcp-tools        - Показать инструменты MCP-сервера")
+        print("  /mcp-call <tool> [JSON] - Вызвать инструмент MCP-сервера")
+        print("  /mcp-stop         - Остановить MCP-сервер")
         print("  /help    - Показать эту справку")
         print("  /exit    - Выйти из программы")
         print("=" * 50 + "\n")
@@ -1412,6 +1418,57 @@ class LLMChat:
         print("\nДОЛГОВРЕМЕННЫЕ ЗНАНИЯ:")
         print(json.dumps(self.facts, ensure_ascii=False, indent=2))
         print()
+
+    def start_mcp_server(self) -> None:
+        try:
+            result = self.mcp_client.start()
+            if result.get("already_running"):
+                print("\nMCP-сервер уже запущен\n")
+                return
+            server = result.get("serverInfo", {})
+            print(
+                f"\nMCP-сервер запущен: {server.get('name', 'unknown')} "
+                f"{server.get('version', '')}\n"
+            )
+        except (MCPClientError, OSError) as error:
+            print(f"\nНе удалось запустить MCP-сервер: {error}\n")
+
+    def show_mcp_tools(self) -> None:
+        try:
+            tools = self.mcp_client.list_tools()
+            print("\nИНСТРУМЕНТЫ MCP-СЕРВЕРА:")
+            for tool in tools:
+                print(f"- {tool.get('name')}: {tool.get('description', '')}")
+                print(
+                    "  Аргументы: "
+                    + json.dumps(tool.get("inputSchema", {}), ensure_ascii=False)
+                )
+            if not tools:
+                print("нет инструментов")
+            print()
+        except MCPClientError as error:
+            print(f"\n{error}\n")
+
+    def call_mcp_tool(self, expression: str) -> None:
+        parts = expression.strip().split(maxsplit=1)
+        if not parts:
+            print("Формат: /mcp-call <tool> [JSON-аргументы]")
+            return
+        name = parts[0]
+        try:
+            arguments = json.loads(parts[1]) if len(parts) == 2 else {}
+            if not isinstance(arguments, dict):
+                raise ValueError("аргументы должны быть JSON-объектом")
+            result = self.mcp_client.call_tool(name, arguments)
+            for content in result.get("content", []):
+                if content.get("type") == "text":
+                    print(f"\n{content.get('text', '')}\n")
+            if result.get("isError"):
+                print("Инструмент завершился с ошибкой\n")
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"\nНекорректные аргументы: {error}\n")
+        except MCPClientError as error:
+            print(f"\nОшибка MCP: {error}\n")
 
     def run(self, use_streaming: bool = False, use_json_mode: bool = False) -> None:
         print("\n" + "=" * 50)
@@ -1531,6 +1588,19 @@ class LLMChat:
                 elif user_input.startswith("/branch "):
                     self.switch_branch(user_input.split(maxsplit=1)[1].strip())
                     continue
+                elif user_input == "/mcp-start":
+                    self.start_mcp_server()
+                    continue
+                elif user_input == "/mcp-tools":
+                    self.show_mcp_tools()
+                    continue
+                elif user_input.startswith("/mcp-call "):
+                    self.call_mcp_tool(user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input == "/mcp-stop":
+                    self.mcp_client.stop()
+                    print("\nMCP-сервер остановлен\n")
+                    continue
                 elif user_input == "/json":
                     use_json_mode = True
                     print("\nПереключено в режим JSON ответов\n")
@@ -1568,6 +1638,8 @@ class LLMChat:
             except Exception as e:
                 print(f"\nНеожиданная ошибка: {e}")
                 print("Попробуйте еще раз или введите /exit для выхода\n")
+
+        self.mcp_client.stop()
 
 
 def main() -> None:
