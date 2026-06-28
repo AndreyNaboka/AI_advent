@@ -121,3 +121,10 @@ class MCPNewsClient:
         if not isinstance(result, dict):
             raise MCPClientError("В ответе MCP-сервера отсутствует result")
         return result
+
+
+class MCPPeriodicSummaryClient(MCPNewsClient):
+    def __init__(self, server_path: Optional[Path] = None):
+        super().__init__(
+            server_path or Path(__file__).with_name("mcp_summary_server.py")
+        )

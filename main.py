@@ -7,7 +7,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from typing import List, Dict, Optional, Any, TypedDict, Literal
 from urllib.parse import urlparse
 
@@ -26,7 +26,7 @@ if (
 
 import requests
 from jsonschema import validate, ValidationError
-from mcp_client import MCPClientError, MCPNewsClient
+from mcp_client import MCPClientError, MCPNewsClient, MCPPeriodicSummaryClient
 
 DEFAULT_API_BASE = "http://localhost:8080"
 DEFAULT_API_PATH = "/v1/chat/completions"
@@ -62,7 +62,10 @@ PROFILE_FILE = Path(__file__).with_name("user_profile.json")
 TASK_STATE_FILE = Path(__file__).with_name("task_state.json")
 INVARIANTS_FILE = Path(__file__).with_name("invariants.json")
 MEMORY_FILE = Path(__file__).with_name("agent_memory.json")
+PERIODIC_SUMMARY_FILE = Path(__file__).with_name("periodic_dialog_summary.json")
 RECENT_MESSAGES_LIMIT = 10
+DEFAULT_SUMMARY_INTERVAL_SECONDS = 300
+DEFAULT_SUMMARY_MIN_MESSAGES = 4
 TASK_STAGES = ("collecting", "planning", "execution", "validation", "done")
 ALLOWED_TASK_TRANSITIONS = {
     "collecting": {"planning"},
@@ -112,6 +115,7 @@ class LLMChat:
         task_state_file: Path = TASK_STATE_FILE,
         invariants_file: Path = INVARIANTS_FILE,
         memory_file: Optional[Path] = None,
+        periodic_summary_file: Path = PERIODIC_SUMMARY_FILE,
         context_strategy: str = CONTEXT_STRATEGY_RECENT,
     ):
         self.api_url: str = api_url
@@ -129,6 +133,7 @@ class LLMChat:
             if profile_file == PROFILE_FILE
             else profile_file.with_name("agent_memory.json")
         )
+        self.periodic_summary_file = periodic_summary_file
         self.context_strategy = (
             context_strategy
             if context_strategy in CONTEXT_STRATEGIES
@@ -164,6 +169,18 @@ class LLMChat:
         self.tokenize_available: Optional[bool] = None
         self.last_token_counts: Optional[Dict[str, int]] = None
         self.mcp_client = MCPNewsClient()
+        self.summary_mcp_client = MCPPeriodicSummaryClient()
+        self.summary_stop_event = Event()
+        self.summary_thread: Optional[Thread] = None
+        self.summary_last_message_count = 0
+        self.summary_interval_seconds = self.get_env_int(
+            "AI_ADVENT_SUMMARY_INTERVAL_SECONDS",
+            DEFAULT_SUMMARY_INTERVAL_SECONDS,
+        )
+        self.summary_min_messages = self.get_env_int(
+            "AI_ADVENT_SUMMARY_MIN_MESSAGES",
+            DEFAULT_SUMMARY_MIN_MESSAGES,
+        )
         self.trim_active_history_if_needed()
 
     def create_memory(
@@ -193,6 +210,16 @@ class LLMChat:
                 "invariants": invariants or [],
             },
         }
+
+    def get_env_int(self, name: str, default: int) -> int:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            print(f"{name} должен быть числом, используется {default}")
+            return default
 
     def load_memories(self, legacy_memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not self.memory_file.exists():
@@ -642,6 +669,105 @@ class LLMChat:
         active_history = self.get_active_history()
         if len(active_history) > RECENT_MESSAGES_LIMIT:
             del active_history[:-RECENT_MESSAGES_LIMIT]
+
+    def get_summary_source_messages(self) -> List[Dict[str, str]]:
+        return [dict(message) for message in self.get_active_history()]
+
+    def load_periodic_summary_text(self) -> str:
+        if not self.periodic_summary_file.exists():
+            return ""
+        try:
+            with self.periodic_summary_file.open("r", encoding="utf-8") as file:
+                value = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return ""
+        if isinstance(value, dict) and isinstance(value.get("summary"), str):
+            return value["summary"]
+        return ""
+
+    def run_periodic_summary_once(self, force: bool = False) -> bool:
+        messages = self.get_summary_source_messages()
+        message_count = len(messages)
+        min_messages = 1 if force else self.summary_min_messages
+        if message_count < min_messages:
+            if force:
+                print("\nНет сообщений для summary\n")
+            return False
+        if not force and message_count == self.summary_last_message_count:
+            return False
+
+        try:
+            if not self.summary_mcp_client.is_running:
+                self.summary_mcp_client.start()
+            result = self.summary_mcp_client.call_tool(
+                "summarize_dialog",
+                {
+                    "api_url": self.api_url,
+                    "messages": messages,
+                    "previous_summary": self.load_periodic_summary_text(),
+                    "output_file": str(self.periodic_summary_file),
+                    "current_user": self.current_user,
+                    "context_strategy": self.context_strategy,
+                },
+            )
+        except (MCPClientError, OSError) as error:
+            if force:
+                print(f"\nНе удалось сделать summary: {error}\n")
+            return False
+
+        if force:
+            for content in result.get("content", []):
+                if content.get("type") == "text":
+                    print(f"\n{content.get('text', '')}\n")
+        if result.get("isError", False):
+            return False
+        self.summary_last_message_count = message_count
+        return True
+
+    def start_periodic_summary(self) -> None:
+        if self.summary_interval_seconds <= 0:
+            return
+        if self.summary_thread and self.summary_thread.is_alive():
+            return
+        try:
+            result = self.summary_mcp_client.start()
+            server = result.get("serverInfo", {})
+            print(
+                "Auto-summary MCP: "
+                f"{server.get('name', 'unknown')} {server.get('version', '')}; "
+                f"интервал {self.summary_interval_seconds} сек; "
+                f"файл {self.periodic_summary_file}"
+            )
+        except (MCPClientError, OSError) as error:
+            print(f"Auto-summary MCP не запущен: {error}")
+            return
+
+        self.summary_stop_event.clear()
+        self.summary_thread = Thread(
+            target=self.periodic_summary_loop,
+            name="periodic-summary-mcp",
+            daemon=True,
+        )
+        self.summary_thread.start()
+
+    def periodic_summary_loop(self) -> None:
+        while not self.summary_stop_event.wait(self.summary_interval_seconds):
+            self.run_periodic_summary_once(force=False)
+
+    def stop_periodic_summary(self) -> None:
+        self.summary_stop_event.set()
+        if self.summary_thread and self.summary_thread.is_alive():
+            self.summary_thread.join(timeout=2)
+        self.summary_mcp_client.stop()
+
+    def show_periodic_summary_status(self) -> None:
+        print("\nAUTO-SUMMARY:")
+        print(f"Файл: {self.periodic_summary_file}")
+        print(f"Интервал: {self.summary_interval_seconds} сек")
+        print(f"Минимум сообщений: {self.summary_min_messages}")
+        print(f"MCP запущен: {'да' if self.summary_mcp_client.is_running else 'нет'}")
+        print(f"Файл существует: {'да' if self.periodic_summary_file.exists() else 'нет'}")
+        print()
 
     def count_text_tokens(self, text: str) -> int:
         """Считает токены через локальный сервер, при недоступности использует оценку."""
@@ -1407,6 +1533,8 @@ class LLMChat:
         print("  /mcp-tools        - Показать инструменты MCP-сервера")
         print("  /mcp-call <tool> [JSON] - Вызвать инструмент MCP-сервера")
         print("  /mcp-stop         - Остановить MCP-сервер")
+        print("  /summary-now      - Сразу обновить periodic summary")
+        print("  /summary-status   - Статус periodic summary")
         print("  /help    - Показать эту справку")
         print("  /exit    - Выйти из программы")
         print("=" * 50 + "\n")
@@ -1548,6 +1676,7 @@ class LLMChat:
             return
 
         print("Сервер доступен! Готов к работе.\n")
+        self.start_periodic_summary()
 
         while self.running:
             try:
@@ -1647,6 +1776,12 @@ class LLMChat:
                     self.mcp_client.stop()
                     print("\nMCP-сервер остановлен\n")
                     continue
+                elif user_input == "/summary-now":
+                    self.run_periodic_summary_once(force=True)
+                    continue
+                elif user_input == "/summary-status":
+                    self.show_periodic_summary_status()
+                    continue
                 elif user_input == "/json":
                     use_json_mode = True
                     print("\nПереключено в режим JSON ответов\n")
@@ -1685,6 +1820,7 @@ class LLMChat:
                 print(f"\nНеожиданная ошибка: {e}")
                 print("Попробуйте еще раз или введите /exit для выхода\n")
 
+        self.stop_periodic_summary()
         self.mcp_client.stop()
 
 

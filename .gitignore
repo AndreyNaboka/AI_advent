@@ -8,3 +8,5 @@ user_profile.json
 task_state.json
 invariants.json
 agent_memory.json
+periodic_dialog_summary.json
+venv312/
