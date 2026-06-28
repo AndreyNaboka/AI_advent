@@ -118,6 +118,72 @@ show_connection_info() {
     echo ""
 }
 
+wait_for_server() {
+    local timeout=${1:-300}
+    local elapsed=0
+    local connect_host="$HOST"
+
+    if [ "$connect_host" = "0.0.0.0" ] || [ "$connect_host" = "::" ]; then
+        connect_host="127.0.0.1"
+    fi
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            return 1
+        fi
+
+        if python3 - "$connect_host" "$PORT" <<'PY' 2>/dev/null
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(1)
+try:
+    sock.connect((host, port))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+        then
+            return 0
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
+}
+
+show_final_info() {
+    echo ""
+    echo "=== LLM сервер запущен ==="
+    echo ""
+    echo "$GPU_INFO"
+    echo "=== Модель ==="
+    echo "Тип: $MODEL_TYPE"
+    echo "Репозиторий: $REPO"
+    echo "Файл: $FILE"
+    echo "Путь: $MODEL_PATH"
+    echo ""
+    echo "=== Сервер ==="
+    echo "Адрес прослушивания: $HOST:$PORT"
+    echo "Логи запуска: $LOG_FILE"
+    show_connection_info
+    echo "Для остановки сервера нажмите Ctrl+C."
+    echo ""
+}
+
+stop_server() {
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID"
+        wait "$SERVER_PID" 2>/dev/null
+    fi
+}
+
 # --- ПРОВЕРКА АРГУМЕНТОВ ---
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
     echo "Ошибка: необходимо указать тип модели (strong, medium, weak)."
@@ -144,17 +210,12 @@ source "$VENV_DIR/bin/activate"
 
 # Убеждаемся, что huggingface_hub установлен
 ensure_hf_installed
-check_gpu_ready
+GPU_INFO=$(check_gpu_ready)
 
 REPO="${MODEL_REPOS[$MODEL_TYPE]}"
 FILE="${MODEL_FILES[$MODEL_TYPE]}"
 MODEL_PATH="$MODELS_DIR/$MODEL_TYPE/$FILE"
-
-echo "=== Запуск LLM сервера (Тип: $MODEL_TYPE) ==="
-echo "Репозиторий: $REPO"
-echo "Модель: $FILE"
-echo "Адрес: $HOST:$PORT"
-show_connection_info
+LOG_FILE="/tmp/ai_advent_llm_${MODEL_TYPE}_${PORT}.log"
 
 if [ ! -f "$MODEL_PATH" ]; then
     echo "Модель не найдена локально."
@@ -182,6 +243,11 @@ else
     echo "Модель найдена в кэше."
 fi
 
+echo "Запускаю LLM сервер, подробные логи пишутся в $LOG_FILE"
+: > "$LOG_FILE"
+
+trap stop_server INT TERM
+
 # Запуск сервера с флагом verbose
 python3 -m llama_cpp.server \
     --model "$MODEL_PATH" \
@@ -189,4 +255,18 @@ python3 -m llama_cpp.server \
     --host "$HOST" \
     --port "$PORT" \
     --n_ctx 8192 \
-    --verbose true
+    --verbose true > "$LOG_FILE" 2>&1 &
+
+SERVER_PID=$!
+
+if wait_for_server 300; then
+    show_final_info
+    wait "$SERVER_PID"
+else
+    echo ""
+    echo "Сервер не успел запуститься или завершился с ошибкой."
+    echo "Последние строки лога:"
+    tail -n 80 "$LOG_FILE"
+    stop_server
+    exit 1
+fi
