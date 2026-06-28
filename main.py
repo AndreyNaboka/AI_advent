@@ -26,7 +26,12 @@ if (
 
 import requests
 from jsonschema import validate, ValidationError
-from mcp_client import MCPClientError, MCPNewsClient, MCPPeriodicSummaryClient
+from mcp_client import (
+    MCPClientError,
+    MCPCodeReviewClient,
+    MCPNewsClient,
+    MCPPeriodicSummaryClient,
+)
 
 DEFAULT_API_BASE = "http://localhost:8080"
 DEFAULT_API_PATH = "/v1/chat/completions"
@@ -170,6 +175,9 @@ class LLMChat:
         self.last_token_counts: Optional[Dict[str, int]] = None
         self.mcp_client = MCPNewsClient()
         self.summary_mcp_client = MCPPeriodicSummaryClient()
+        self.code_review_mcp_client = MCPCodeReviewClient()
+        self.last_code_review_problems: List[Dict[str, Any]] = []
+        self.last_code_review_folder: Optional[str] = None
         self.summary_stop_event = Event()
         self.summary_thread: Optional[Thread] = None
         self.summary_last_message_count = 0
@@ -1535,6 +1543,13 @@ class LLMChat:
         print("  /mcp-stop         - Остановить MCP-сервер")
         print("  /summary-now      - Сразу обновить periodic summary")
         print("  /summary-status   - Статус periodic summary")
+        print("  /code-review <папка> - MCP review исходного кода в папке")
+        print("  /code-review-deep <папка> - Более глубокое review большего числа файлов")
+        print("  /bugs-write       - Записать проблемы в <review-папка>/bugs/*.txt")
+        print("  /bugs-fix [папка] - Исправить баги из <папка>/bugs/*.txt")
+        print("  Также можно: сделай ревью /path/to/project")
+        print("  Также можно: запиши баги в папку")
+        print("  Также можно: исправь баги")
         print("  /help    - Показать эту справку")
         print("  /exit    - Выйти из программы")
         print("=" * 50 + "\n")
@@ -1640,6 +1655,183 @@ class LLMChat:
             print(f"\nНекорректные аргументы: {error}\n")
         except MCPClientError as error:
             print(f"\nОшибка MCP: {error}\n")
+
+    def start_code_review_mcp(self) -> None:
+        if self.code_review_mcp_client.is_running:
+            return
+        self.code_review_mcp_client.start()
+
+    def default_review_folder(self) -> str:
+        return str(Path(__file__).resolve().parent)
+
+    def extract_review_folder_from_text(self, text: str) -> str:
+        return self.extract_optional_folder_from_text(text) or self.default_review_folder()
+
+    def extract_optional_folder_from_text(self, text: str) -> str:
+        stripped = text.strip()
+        quoted = re.search(r"[\"'«“](.*?)[\"'»”]", stripped)
+        if quoted and quoted.group(1).strip():
+            return quoted.group(1).strip()
+
+        tokens = stripped.split()
+        for token in reversed(tokens):
+            cleaned = token.strip(".,;:()[]{}")
+            if (
+                "/" in cleaned
+                or cleaned.startswith("~")
+                or cleaned.startswith(".")
+            ):
+                return cleaned
+        return ""
+
+    def is_natural_review_request(self, text: str) -> bool:
+        normalized = text.casefold()
+        review_terms = (
+            "сделай ревью",
+            "сделать ревью",
+            "проведи ревью",
+            "провести ревью",
+            "ревью кода",
+            "код ревью",
+            "code review",
+            "review code",
+        )
+        flexible_review_patterns = (
+            r"\bсдела(?:й|ть)\b.*\bревью\b",
+            r"\bпровед(?:и|ите|ение|ести)\b.*\bревью\b",
+            r"\breview\b.*\bcode\b",
+            r"\bcode\b.*\breview\b",
+        )
+        return any(term in normalized for term in review_terms) or any(
+            re.search(pattern, normalized) for pattern in flexible_review_patterns
+        )
+
+    def is_deep_review_request(self, text: str) -> bool:
+        normalized = text.casefold()
+        return self.is_natural_review_request(text) and any(
+            term in normalized for term in ("глубок", "подробн", "полное", "deep")
+        )
+
+    def is_natural_bug_write_request(self, text: str) -> bool:
+        normalized = text.casefold()
+        has_bug_term = any(term in normalized for term in ("баг", "bug", "проблем"))
+        has_write_term = any(
+            term in normalized
+            for term in (
+                "запиши",
+                "записать",
+                "создай",
+                "создать",
+                "сохрани",
+                "сохранить",
+                "выведи",
+                "вывести",
+                "добавь",
+                "добавить",
+            )
+        )
+        has_folder_term = any(term in normalized for term in ("папк", "файл", "bugs"))
+        return has_bug_term and has_write_term and has_folder_term
+
+    def is_natural_bug_fix_request(self, text: str) -> bool:
+        normalized = text.casefold()
+        has_bug_term = any(term in normalized for term in ("баг", "bug", "проблем"))
+        has_fix_term = any(
+            term in normalized
+            for term in (
+                "исправь",
+                "исправить",
+                "почини",
+                "починить",
+                "зафикси",
+                "фикс",
+                "fix",
+            )
+        )
+        return has_bug_term and has_fix_term
+
+    def review_code_folder(self, folder_expression: str, deep: bool = False) -> None:
+        folder = folder_expression.strip() or self.default_review_folder()
+        if not folder:
+            print("Формат: /code-review <папка>")
+            return
+        try:
+            arguments: Dict[str, Any] = {
+                "api_url": self.api_url,
+                "folder_path": folder,
+            }
+            if deep:
+                arguments.update(
+                    {
+                        "max_files": 300,
+                        "max_chars_per_file": 10000,
+                        "batch_chars": 30000,
+                    }
+                )
+            self.start_code_review_mcp()
+            result = self.code_review_mcp_client.call_tool(
+                "review_code_folder",
+                arguments,
+            )
+            for content in result.get("content", []):
+                if content.get("type") == "text":
+                    print(f"\n{content.get('text', '')}\n")
+            structured = result.get("structuredContent", {})
+            problems = structured.get("problems", [])
+            self.last_code_review_problems = (
+                problems if isinstance(problems, list) else []
+            )
+            reviewed_folder = structured.get("folder")
+            self.last_code_review_folder = (
+                reviewed_folder if isinstance(reviewed_folder, str) else folder
+            )
+            if self.last_code_review_problems:
+                print(
+                    "Чтобы записать проблемы в файлы, выполните: /bugs-write"
+                )
+        except (MCPClientError, OSError) as error:
+            print(f"\nОшибка code review MCP: {error}\n")
+
+    def write_bug_reports(self) -> None:
+        if not self.last_code_review_problems:
+            print("\nНет сохраненного списка проблем. Сначала выполните /code-review <папка>\n")
+            return
+        if not self.last_code_review_folder:
+            print("\nНеизвестна папка последнего review. Сначала выполните /code-review <папка>\n")
+            return
+        try:
+            self.start_code_review_mcp()
+            result = self.code_review_mcp_client.call_tool(
+                "write_bug_reports",
+                {
+                    "project_dir": self.last_code_review_folder,
+                    "problems": self.last_code_review_problems,
+                },
+            )
+            for content in result.get("content", []):
+                if content.get("type") == "text":
+                    print(f"\n{content.get('text', '')}\n")
+        except (MCPClientError, OSError) as error:
+            print(f"\nОшибка записи bug-файлов: {error}\n")
+
+    def fix_bugs_from_folder(self, folder_expression: str = "") -> None:
+        folder = folder_expression.strip()
+        if not folder:
+            folder = self.last_code_review_folder or self.default_review_folder()
+        try:
+            self.start_code_review_mcp()
+            result = self.code_review_mcp_client.call_tool(
+                "fix_bugs_from_folder",
+                {
+                    "api_url": self.api_url,
+                    "project_dir": folder,
+                },
+            )
+            for content in result.get("content", []):
+                if content.get("type") == "text":
+                    print(f"\n{content.get('text', '')}\n")
+        except (MCPClientError, OSError) as error:
+            print(f"\nОшибка исправления bug-файлов: {error}\n")
 
     def run(self, use_streaming: bool = False, use_json_mode: bool = False) -> None:
         print("\n" + "=" * 50)
@@ -1782,6 +1974,38 @@ class LLMChat:
                 elif user_input == "/summary-status":
                     self.show_periodic_summary_status()
                     continue
+                elif user_input == "/code-review-deep":
+                    self.review_code_folder("", deep=True)
+                    continue
+                elif user_input.startswith("/code-review-deep "):
+                    self.review_code_folder(user_input.split(maxsplit=1)[1], deep=True)
+                    continue
+                elif user_input.startswith("/code-review "):
+                    self.review_code_folder(user_input.split(maxsplit=1)[1])
+                    continue
+                elif user_input == "/bugs-write":
+                    self.write_bug_reports()
+                    continue
+                elif user_input == "/bugs-fix":
+                    self.fix_bugs_from_folder()
+                    continue
+                elif user_input.startswith("/bugs-fix "):
+                    self.fix_bugs_from_folder(user_input.split(maxsplit=1)[1])
+                    continue
+                elif self.is_natural_review_request(user_input):
+                    self.review_code_folder(
+                        self.extract_review_folder_from_text(user_input),
+                        deep=self.is_deep_review_request(user_input),
+                    )
+                    continue
+                elif self.is_natural_bug_fix_request(user_input):
+                    self.fix_bugs_from_folder(
+                        self.extract_optional_folder_from_text(user_input)
+                    )
+                    continue
+                elif self.is_natural_bug_write_request(user_input):
+                    self.write_bug_reports()
+                    continue
                 elif user_input == "/json":
                     use_json_mode = True
                     print("\nПереключено в режим JSON ответов\n")
@@ -1822,6 +2046,7 @@ class LLMChat:
 
         self.stop_periodic_summary()
         self.mcp_client.stop()
+        self.code_review_mcp_client.stop()
 
 
 def main() -> None:

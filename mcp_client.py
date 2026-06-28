@@ -128,3 +128,10 @@ class MCPPeriodicSummaryClient(MCPNewsClient):
         super().__init__(
             server_path or Path(__file__).with_name("mcp_summary_server.py")
         )
+
+
+class MCPCodeReviewClient(MCPNewsClient):
+    def __init__(self, server_path: Optional[Path] = None):
+        super().__init__(
+            server_path or Path(__file__).with_name("mcp_code_review_server.py")
+        )

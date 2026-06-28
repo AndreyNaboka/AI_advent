@@ -1,3 +1,4 @@
+bugs/
 __pycache__/
 venv/
 conversation_history.json
