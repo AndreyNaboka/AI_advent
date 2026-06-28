@@ -20,13 +20,16 @@ MODEL_FILES["weak"]="qwen2.5-1.5b-instruct-q8_0.gguf"
 
 # --- ФУНКЦИЯ ПОМОЩИ ---
 show_help() {
-    echo "Использование: $0 {strong|medium|weak}"
+    echo "Использование: $0 {strong|medium|weak} [host] [port]"
     echo ""
     echo "  strong   - Запустить сильную модель (14B, высокое качество)"
     echo "  medium   - Запустить среднюю модель (7B, баланс скорости и качества)"
     echo "  weak     - Запустить слабую модель (1.5B, максимальная скорость)"
+    echo "  host     - Адрес прослушивания, по умолчанию 0.0.0.0 для локальной сети"
+    echo "  port     - Порт, по умолчанию 8080"
     echo ""
     echo "Пример: $0 medium"
+    echo "Пример для локальной сети: $0 medium 0.0.0.0 8080"
     exit 1
 }
 
@@ -83,17 +86,56 @@ show_available_files() {
     fi
 }
 
+# --- ФУНКЦИЯ ПОКАЗА АДРЕСОВ ДЛЯ ПОДКЛЮЧЕНИЯ ---
+show_connection_info() {
+    local ips=""
+
+    if command -v hostname &> /dev/null; then
+        ips=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | sort -u)
+    fi
+
+    if [ -z "$ips" ] && command -v ip &> /dev/null; then
+        ips=$(ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | sort -u)
+    fi
+
+    if [ -z "$ips" ] && command -v ifconfig &> /dev/null; then
+        ips=$(ifconfig 2>/dev/null | grep -E 'inet [0-9]' | awk '{print $2}' | grep -v '^127\.' | sort -u)
+    fi
+
+    echo ""
+    echo "=== Подключение клиента ==="
+    if [ -n "$ips" ]; then
+        echo "$ips" | while read -r ip_addr; do
+            [ -z "$ip_addr" ] && continue
+            echo "python3 main.py --server ${ip_addr}:${PORT}"
+        done
+    else
+        echo "Не удалось автоматически определить IP этой машины."
+        echo "Узнайте LAN IP вручную и подключайтесь так:"
+        echo "python3 main.py --server <IP_СЕРВЕРА>:${PORT}"
+    fi
+    echo "==========================="
+    echo ""
+}
+
 # --- ПРОВЕРКА АРГУМЕНТОВ ---
-if [ $# -ne 1 ]; then
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
     echo "Ошибка: необходимо указать тип модели (strong, medium, weak)."
     show_help
 fi
 
 MODEL_TYPE=$1
+HOST=${2:-${LLM_HOST:-0.0.0.0}}
+PORT=${3:-${LLM_PORT:-8080}}
 
 if [[ -z "${MODEL_REPOS[$MODEL_TYPE]}" ]]; then
     echo "Ошибка: неизвестный тип модели '$MODEL_TYPE'."
     show_help
+fi
+
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "Ошибка: порт должен быть числом."
+    exit 1
 fi
 
 # --- АКТИВАЦИЯ ОКРУЖЕНИЯ И ПОДГОТОВКА ---
@@ -111,6 +153,8 @@ MODEL_PATH="$MODELS_DIR/$MODEL_TYPE/$FILE"
 echo "=== Запуск LLM сервера (Тип: $MODEL_TYPE) ==="
 echo "Репозиторий: $REPO"
 echo "Модель: $FILE"
+echo "Адрес: $HOST:$PORT"
+show_connection_info
 
 if [ ! -f "$MODEL_PATH" ]; then
     echo "Модель не найдена локально."
@@ -142,6 +186,7 @@ fi
 python3 -m llama_cpp.server \
     --model "$MODEL_PATH" \
     --n_gpu_layers -1 \
-    --port 8080 \
+    --host "$HOST" \
+    --port "$PORT" \
     --n_ctx 8192 \
     --verbose true

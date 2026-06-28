@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import re
+import socket
 import sys
 import time
 from pathlib import Path
 from threading import Thread
 from typing import List, Dict, Optional, Any, TypedDict, Literal
+from urllib.parse import urlparse
 
 
 PROJECT_VENV = Path(__file__).with_name("venv312")
@@ -25,7 +28,31 @@ import requests
 from jsonschema import validate, ValidationError
 from mcp_client import MCPClientError, MCPNewsClient
 
-API_URL = "http://localhost:8080/v1/chat/completions"
+DEFAULT_API_BASE = "http://localhost:8080"
+DEFAULT_API_PATH = "/v1/chat/completions"
+
+
+def normalize_api_url(value: str) -> str:
+    """Accepts host[:port], base URL, or full chat completions URL."""
+    url = value.strip().rstrip("/")
+    if not url:
+        url = DEFAULT_API_BASE
+    if "://" not in url:
+        url = f"http://{url}"
+    if not url.endswith(DEFAULT_API_PATH):
+        url = url.rstrip("/") + DEFAULT_API_PATH
+    return url
+
+
+def api_base_from_url(api_url: str) -> str:
+    return api_url.split("/v1/", 1)[0].rstrip("/")
+
+
+API_URL = normalize_api_url(
+    os.environ.get("AI_ADVENT_API_URL")
+    or os.environ.get("AI_ADVENT_API_BASE")
+    or DEFAULT_API_BASE
+)
 DEFAULT_TEMPERATURE = 0.7
 HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
 SUMMARY_FILE = Path(__file__).with_name("conversation_summary.json")
@@ -88,7 +115,8 @@ class LLMChat:
         context_strategy: str = CONTEXT_STRATEGY_RECENT,
     ):
         self.api_url: str = api_url
-        self.tokenize_url: str = api_url.split("/v1/", 1)[0] + "/tokenize"
+        self.api_base_url: str = api_base_from_url(api_url)
+        self.tokenize_url: str = self.api_base_url + "/tokenize"
         self.history_file = history_file
         self.summary_file = summary_file
         self.facts_file = facts_file
@@ -751,16 +779,29 @@ class LLMChat:
         try:
             requests.options(self.api_url, timeout=2)
             return True
-        except:
+        except requests.RequestException:
             try:
-                import socket
+                parsed_url = urlparse(self.api_base_url)
+                host = parsed_url.hostname
+                port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+                if not host:
+                    return False
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
-                result = sock.connect_ex(("localhost", 8080))
+                result = sock.connect_ex((host, port))
                 sock.close()
                 return result == 0
-            except:
+            except OSError:
                 return False
+
+    def server_hint(self) -> str:
+        return (
+            f"Сейчас клиент настроен на {self.api_url}\n"
+            "Для сервера на другой машине запустите клиент так:\n"
+            "   python3 main.py --server 192.168.1.50:8080\n"
+            "или через переменную окружения:\n"
+            "   AI_ADVENT_API_BASE=http://192.168.1.50:8080 python3 main.py"
+        )
 
     def get_temperature_from_user(self) -> float:
         """Запрашивает температуру у пользователя. Enter -> значение по умолчанию"""
@@ -1096,7 +1137,8 @@ class LLMChat:
             return None
         except requests.exceptions.ConnectionError:
             print("\nОшибка: Не удалось подключиться к серверу. Запустите сервер командой:")
-            print("   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
+            print("   ./start_server.sh medium")
+            print(self.server_hint())
             return None
         except Exception as e:
             print(f"\nОшибка: {e}")
@@ -1393,7 +1435,7 @@ class LLMChat:
     def check_status(self) -> None:
         print("\nПроверка статуса...")
         if self.check_server():
-            print("Сервер доступен (порт 8080)")
+            print(f"Сервер доступен: {self.api_base_url}")
             try:
                 test_payload = {
                     "messages": [{"role": "user", "content": "ping"}],
@@ -1408,7 +1450,8 @@ class LLMChat:
                 print("Модель не отвечает на тестовый запрос")
         else:
             print("Сервер недоступен! Запустите сервер командой:")
-            print("   python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
+            print("   ./start_server.sh medium")
+            print(self.server_hint())
         print()
 
     def show_facts(self) -> None:
@@ -1479,6 +1522,7 @@ class LLMChat:
         print(f"Формат ответа: {'JSON' if use_json_mode else 'текстовый'}")
         print(f"Стратегия контекста: {self.context_strategy}")
         print(f"Активный пользователь: {self.current_user}")
+        print(f"LLM API: {self.api_url}")
         print("Введите /help для списка команд")
         print(f"Файл памяти: {self.memory_file}")
         active_history = self.get_active_history()
@@ -1496,8 +1540,10 @@ class LLMChat:
         if not self.check_server():
             print("СЕРВЕР НЕ ДОСТУПЕН!")
             print("\nЗапустите сервер в другом терминале:")
-            print("cd ~/llm_project && source venv/bin/activate")
-            print("python3 -m llama_cpp.server --model ~/models/qwen3-4b/qwen3-4b-instruct-2507-q8_0.gguf --n_gpu_layers 99 --port 8080")
+            print("cd ~/code/AI_advent")
+            print("./start_server.sh medium")
+            print()
+            print(self.server_hint())
             print("\nПосле запуска сервера, перезапустите эту программу.")
             return
 
@@ -1643,6 +1689,26 @@ class LLMChat:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Клиент для OpenAI-compatible локального LLM сервера."
+    )
+    parser.add_argument(
+        "--server",
+        help=(
+            "Адрес сервера без пути, например 192.168.1.50:8080 "
+            "или http://192.168.1.50:8080"
+        ),
+    )
+    parser.add_argument(
+        "--api-url",
+        help=(
+            "Полный URL chat completions endpoint, например "
+            "http://192.168.1.50:8080/v1/chat/completions"
+        ),
+    )
+    args = parser.parse_args()
+    api_url = normalize_api_url(args.api_url or args.server or API_URL)
+
     print("Выберите режим работы:")
     print("1. Обычный режим (модель думает, затем выдает полный ответ)")
     print("2. Потоковый режим (ответ появляется по словам в реальном времени)")
@@ -1666,7 +1732,7 @@ def main() -> None:
     }
     context_strategy = strategy_by_choice.get(strategy_choice, CONTEXT_STRATEGY_RECENT)
 
-    chat = LLMChat(context_strategy=context_strategy)
+    chat = LLMChat(api_url=api_url, context_strategy=context_strategy)
     chat.run(use_streaming=use_streaming, use_json_mode=use_json_mode)
 
 
