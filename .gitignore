@@ -1,3 +1,5 @@
+docs/
+.DS_Store
 bugs/
 __pycache__/
 venv/

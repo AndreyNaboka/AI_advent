@@ -1,0 +1,19 @@
+chunking:
+  target_chunk_tokens: 500
+  min_chunk_tokens: 150
+  max_chunk_tokens: 900
+  overlap_tokens: 80
+  code_overlap_tokens: 30
+
+embedding:
+  ollama_url: "http://localhost:11434"
+  embedding_model: "nomic-embed-text"
+  batch_size: 16
+
+qdrant:
+  url: "http://localhost:6333"
+  collection_name: "local_knowledge_base"
+
+output:
+  chunks_file: "chunks.jsonl"
+  log_file: "rag_indexer.log"
