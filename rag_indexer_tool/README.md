@@ -44,8 +44,10 @@ ollama pull nomic-embed-text
 Создать chunks:
 
 ```bash
-./.venv/bin/python main.py chunk --input ./docs --output ./chunks.jsonl
+./.venv/bin/python main.py chunk --input ./docs
 ```
+
+По умолчанию `chunks.jsonl` создаётся в той же папке, которая анализируется. Путь можно переопределить через `--output`.
 
 Построить embeddings и загрузить их в Qdrant:
 

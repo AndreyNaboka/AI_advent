@@ -68,18 +68,24 @@ def run_chunk(args: argparse.Namespace) -> int:
     logger = setup_logging(args.log or cfg.get("output", {}).get("log_file", "rag_indexer.log"))
     chunk_config = build_chunk_config(cfg, args)
     input_root = Path(args.input).expanduser().resolve()
-    output_path = Path(args.output or cfg.get("output", {}).get("chunks_file", "chunks.jsonl")).expanduser()
 
     if not input_root.exists() or not input_root.is_dir():
         logger.error("Input path is not a directory: %s", input_root)
         return 2
 
+    if args.output:
+        output_path = Path(args.output).expanduser()
+    else:
+        output_path = input_root / cfg.get("output", {}).get("chunks_file", "chunks.jsonl")
+
     found = processed = skipped = errors = chunk_count = 0
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_resolved = output_path.resolve()
+    file_entries = [(path, supported) for path, supported in iter_files(input_root) if path.resolve() != output_resolved]
     created_at = datetime.now(timezone.utc).isoformat()
 
     with output_path.open("w", encoding="utf-8") as out:
-        for path, supported in iter_files(input_root):
+        for path, supported in file_entries:
             found += 1
             rel_path = path.relative_to(input_root).as_posix()
             if not supported:
