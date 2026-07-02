@@ -62,6 +62,7 @@ API_URL = normalize_api_url(
 DEFAULT_TEMPERATURE = 0.7
 RAG_CONFIG_FILE = Path(__file__).with_name("rag_indexer_tool") / "config.yaml"
 DEFAULT_RAG_SCORE_THRESHOLD = 0.72
+DEFAULT_RAG_PRE_TOP_K = 10
 DEFAULT_RAG_TOP_K = 5
 DEFAULT_RAG_MAX_CONTEXT_CHARS = 12000
 HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
@@ -200,10 +201,16 @@ class LLMChat:
             "AI_ADVENT_RAG_SCORE_THRESHOLD",
             DEFAULT_RAG_SCORE_THRESHOLD,
         )
+        self.rag_pre_top_k = self.get_env_int(
+            "AI_ADVENT_RAG_PRE_TOP_K", DEFAULT_RAG_PRE_TOP_K
+        )
         self.rag_top_k = self.get_env_int("AI_ADVENT_RAG_TOP_K", DEFAULT_RAG_TOP_K)
         self.rag_max_context_chars = self.get_env_int(
             "AI_ADVENT_RAG_MAX_CONTEXT_CHARS",
             DEFAULT_RAG_MAX_CONTEXT_CHARS,
+        )
+        self.rag_query_rewrite_enabled = self.get_env_bool(
+            "AI_ADVENT_RAG_QUERY_REWRITE", True
         )
         self.trim_active_history_if_needed()
 
@@ -906,43 +913,84 @@ class LLMChat:
             raise RuntimeError(f"Unexpected Ollama embedding response: {data.keys()}")
         return embeddings[0]
 
-    def search_rag(self, message: str) -> Optional[Dict[str, Any]]:
-        if not self.rag_enabled:
-            return None
+    def rewrite_rag_query(self, message: str) -> str:
+        if not self.rag_query_rewrite_enabled:
+            return message
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the user's question into a concise search query "
+                        "for a local vector knowledge base. Preserve exact names, "
+                        "codes, product identifiers, numbers, and quoted phrases. "
+                        "Return only the rewritten query, no markdown."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+            "max_tokens": 120,
+            "temperature": 0.0,
+        }
         try:
-            from qdrant_client import QdrantClient
-        except ImportError:
-            return None
-
-        qdrant_url = os.environ.get("AI_ADVENT_RAG_QDRANT_URL") or self.get_rag_setting(
-            "qdrant", "url", "http://localhost:6333"
-        )
-        collection = os.environ.get("AI_ADVENT_RAG_COLLECTION") or self.get_rag_setting(
-            "qdrant", "collection_name", "local_knowledge_base"
-        )
-
-        try:
-            query_vector = self.embed_rag_query(message)
-            client = QdrantClient(url=qdrant_url)
-            if hasattr(client, "query_points"):
-                result = client.query_points(
-                    collection_name=collection,
-                    query=query_vector,
-                    limit=self.rag_top_k,
-                    with_payload=True,
-                )
-                raw_points = getattr(result, "points", result)
-            else:
-                raw_points = client.search(
-                    collection_name=collection,
-                    query_vector=query_vector,
-                    limit=self.rag_top_k,
-                    with_payload=True,
-                )
+            response = requests.post(self.api_url, json=payload, timeout=20)
+            response.raise_for_status()
+            rewritten = response.json()["choices"][0]["message"]["content"].strip()
+            return rewritten or message
         except Exception as error:
             if self.get_env_bool("AI_ADVENT_RAG_DEBUG", False):
-                print(f"RAG недоступен, используется обычная LLM: {error}")
-            return None
+                print(f"RAG query rewrite недоступен, используется исходный вопрос: {error}")
+            return message
+
+    def tokenize_for_rerank(self, text: str) -> set[str]:
+        return {
+            token.casefold()
+            for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9_.:-]+", text)
+            if len(token) > 2
+        }
+
+    def rerank_rag_hits(
+        self, hits: List[Dict[str, Any]], original_query: str, rewritten_query: str
+    ) -> List[Dict[str, Any]]:
+        query_tokens = self.tokenize_for_rerank(f"{original_query} {rewritten_query}")
+        filtered = [
+            dict(hit)
+            for hit in hits
+            if float(hit.get("score", 0.0) or 0.0) >= self.rag_score_threshold
+        ]
+        for hit in filtered:
+            text_tokens = self.tokenize_for_rerank(
+                f"{hit.get('source_path', '')} {hit.get('text', '')}"
+            )
+            overlap = len(query_tokens & text_tokens) / max(1, len(query_tokens))
+            hit["rerank_score"] = (0.85 * float(hit["score"])) + (0.15 * overlap)
+            hit["lexical_overlap"] = overlap
+        filtered.sort(key=lambda item: item["rerank_score"], reverse=True)
+        return filtered[: self.rag_top_k]
+
+    def query_qdrant_hits(
+        self, qdrant_url: str, collection: str, query: str
+    ) -> List[Dict[str, Any]]:
+        from qdrant_client import QdrantClient
+
+        query_vector = self.embed_rag_query(query)
+        client = QdrantClient(url=qdrant_url)
+        limit = max(self.rag_pre_top_k, self.rag_top_k)
+        if hasattr(client, "query_points"):
+            result = client.query_points(
+                collection_name=collection,
+                query=query_vector,
+                limit=limit,
+                with_payload=True,
+            )
+            raw_points = getattr(result, "points", result)
+        else:
+            raw_points = client.search(
+                collection_name=collection,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+            )
 
         hits: List[Dict[str, Any]] = []
         for point in raw_points:
@@ -968,11 +1016,54 @@ class LLMChat:
                     "page_end": payload.get("page_end"),
                 }
             )
+        return hits
+
+    def search_rag(self, message: str) -> Optional[Dict[str, Any]]:
+        if not self.rag_enabled:
+            return None
+        try:
+            from qdrant_client import QdrantClient
+        except ImportError:
+            return None
+
+        qdrant_url = os.environ.get("AI_ADVENT_RAG_QDRANT_URL") or self.get_rag_setting(
+            "qdrant", "url", "http://localhost:6333"
+        )
+        collection = os.environ.get("AI_ADVENT_RAG_COLLECTION") or self.get_rag_setting(
+            "qdrant", "collection_name", "local_knowledge_base"
+        )
+
+        try:
+            rewritten_query = self.rewrite_rag_query(message)
+            hits = self.query_qdrant_hits(qdrant_url, collection, rewritten_query)
+        except Exception as error:
+            if self.get_env_bool("AI_ADVENT_RAG_DEBUG", False):
+                print(f"RAG недоступен, используется обычная LLM: {error}")
+            return None
 
         best_score = max((hit["score"] for hit in hits), default=0.0)
-        if best_score < self.rag_score_threshold:
+        filtered_hits = self.rerank_rag_hits(hits, message, rewritten_query)
+        fallback_used = False
+        if not filtered_hits and rewritten_query != message:
+            try:
+                hits = self.query_qdrant_hits(qdrant_url, collection, message)
+                best_score = max((hit["score"] for hit in hits), default=0.0)
+                filtered_hits = self.rerank_rag_hits(hits, message, message)
+                fallback_used = bool(filtered_hits)
+            except Exception as error:
+                if self.get_env_bool("AI_ADVENT_RAG_DEBUG", False):
+                    print(f"RAG fallback по исходному вопросу не сработал: {error}")
+        if not filtered_hits:
             return None
-        return {"best_score": best_score, "hits": hits}
+        return {
+            "best_score": best_score,
+            "hits": filtered_hits,
+            "raw_hit_count": len(hits),
+            "filtered_hit_count": len(filtered_hits),
+            "query": message,
+            "rewritten_query": rewritten_query,
+            "fallback_to_original_query": fallback_used,
+        }
 
     def format_rag_context(self, rag_context: Dict[str, Any]) -> str:
         parts: List[str] = []
@@ -999,6 +1090,7 @@ class LLMChat:
                 text = text[:remaining].rstrip()
             block = (
                 f"[{index}] score={hit['score']:.3f}; "
+                f"rerank={hit.get('rerank_score', hit['score']):.3f}; "
                 f"источник: {', '.join(location_parts)}\n"
                 f"{text}"
             )
@@ -1021,7 +1113,8 @@ class LLMChat:
             )
             lines.append(
                 f"{index}. {hit['source_path']}{chunk} "
-                f"(score {hit['score']:.3f})"
+                f"(score {hit['score']:.3f}, "
+                f"rerank {hit.get('rerank_score', hit['score']):.3f})"
             )
         return "\n".join(lines)
 
@@ -1310,6 +1403,7 @@ class LLMChat:
                             "source_path": hit["source_path"],
                             "chunk_index": hit["chunk_index"],
                             "score": hit["score"],
+                            "rerank_score": hit.get("rerank_score"),
                         }
                         for hit in rag_context["hits"]
                     ]
@@ -1362,7 +1456,10 @@ class LLMChat:
         if rag_context:
             print(
                 "RAG: найден релевантный контекст "
-                f"(score {rag_context['best_score']:.3f}), ответ будет без streaming."
+                f"(score {rag_context['best_score']:.3f}, "
+                f"{rag_context.get('filtered_hit_count', len(rag_context['hits']))}/"
+                f"{rag_context.get('raw_hit_count', len(rag_context['hits']))} chunks), "
+                "ответ будет без streaming."
             )
             return self.send_message_simple(
                 message, temperature, system_prompt, rag_context=rag_context
@@ -1446,7 +1543,11 @@ class LLMChat:
         if rag_context is None:
             rag_context = self.search_rag(message)
         if rag_context:
-            print(f"RAG: используется локальная база, score {rag_context['best_score']:.3f}")
+            print(
+                f"RAG: используется локальная база, score {rag_context['best_score']:.3f}, "
+                f"chunks {rag_context.get('filtered_hit_count', len(rag_context['hits']))}/"
+                f"{rag_context.get('raw_hit_count', len(rag_context['hits']))}"
+            )
 
         self.append_message("user", message)
         self.trim_active_history_if_needed()
@@ -1875,7 +1976,9 @@ class LLMChat:
         print(f"Collection: {collection}")
         print(f"Ollama embeddings: {ollama_url} / {model}")
         print(f"Threshold: {self.rag_score_threshold}")
-        print(f"Top-K: {self.rag_top_k}")
+        print(f"Top-K до фильтрации: {self.rag_pre_top_k}")
+        print(f"Top-K после фильтрации: {self.rag_top_k}")
+        print(f"Query rewrite: {'да' if self.rag_query_rewrite_enabled else 'нет'}")
         print(f"qdrant-client установлен: {'да' if qdrant_installed else 'нет'}")
         print(f"Коллекция доступна: {'да' if qdrant_ready else 'нет'}")
         print()
@@ -2129,7 +2232,9 @@ class LLMChat:
         print(
             "RAG: "
             f"{'включен' if self.rag_enabled else 'выключен'}, "
-            f"threshold {self.rag_score_threshold}, top_k {self.rag_top_k}"
+            f"threshold {self.rag_score_threshold}, "
+            f"top_k {self.rag_pre_top_k}->{self.rag_top_k}, "
+            f"rewrite {'on' if self.rag_query_rewrite_enabled else 'off'}"
         )
         print("Введите /help для списка команд")
         print(f"Файл памяти: {self.memory_file}")

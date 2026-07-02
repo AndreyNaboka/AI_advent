@@ -2,7 +2,10 @@ docs/
 .DS_Store
 bugs/
 __pycache__/
+*.pyc
+.venv/
 venv/
+venv312/
 conversation_history.json
 conversation_summary.json
 conversation_facts.json
@@ -12,4 +15,18 @@ task_state.json
 invariants.json
 agent_memory.json
 periodic_dialog_summary.json
-venv312/
+
+# Clean export artifacts
+AI_advent_export/
+AI_advent_export.tar.gz
+
+# Local RAG/Qdrant artifacts
+rag_indexer_tool/.venv/
+rag_indexer_tool/qdrant_storage/
+rag_indexer_tool/*.log
+rag_indexer_tool/*.jsonl
+
+# Local eval reports
+rag_eval_report.json
+rag_retrieval_report.json
+rag_rerank_eval_report.json
