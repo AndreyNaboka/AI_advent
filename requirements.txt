@@ -18,6 +18,7 @@ pydantic-settings==2.14.1
 pydantic_core==2.46.4
 python-dotenv==1.2.2
 PyYAML==6.0.3
+qdrant-client>=1.9.0
 requests==2.34.2
 sse-starlette==3.4.4
 starlette==1.2.1

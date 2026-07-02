@@ -25,6 +25,7 @@ if (
     os.execv(str(PROJECT_VENV_PYTHON), [str(PROJECT_VENV_PYTHON), *sys.argv])
 
 import requests
+import yaml
 from jsonschema import validate, ValidationError
 from mcp_client import (
     MCPClientError,
@@ -59,6 +60,10 @@ API_URL = normalize_api_url(
     or DEFAULT_API_BASE
 )
 DEFAULT_TEMPERATURE = 0.7
+RAG_CONFIG_FILE = Path(__file__).with_name("rag_indexer_tool") / "config.yaml"
+DEFAULT_RAG_SCORE_THRESHOLD = 0.72
+DEFAULT_RAG_TOP_K = 5
+DEFAULT_RAG_MAX_CONTEXT_CHARS = 12000
 HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
 SUMMARY_FILE = Path(__file__).with_name("conversation_summary.json")
 FACTS_FILE = Path(__file__).with_name("conversation_facts.json")
@@ -189,6 +194,17 @@ class LLMChat:
             "AI_ADVENT_SUMMARY_MIN_MESSAGES",
             DEFAULT_SUMMARY_MIN_MESSAGES,
         )
+        self.rag_config = self.load_rag_config()
+        self.rag_enabled = self.get_env_bool("AI_ADVENT_RAG_ENABLED", True)
+        self.rag_score_threshold = self.get_env_float(
+            "AI_ADVENT_RAG_SCORE_THRESHOLD",
+            DEFAULT_RAG_SCORE_THRESHOLD,
+        )
+        self.rag_top_k = self.get_env_int("AI_ADVENT_RAG_TOP_K", DEFAULT_RAG_TOP_K)
+        self.rag_max_context_chars = self.get_env_int(
+            "AI_ADVENT_RAG_MAX_CONTEXT_CHARS",
+            DEFAULT_RAG_MAX_CONTEXT_CHARS,
+        )
         self.trim_active_history_if_needed()
 
     def create_memory(
@@ -228,6 +244,33 @@ class LLMChat:
         except ValueError:
             print(f"{name} должен быть числом, используется {default}")
             return default
+
+    def get_env_float(self, name: str, default: float) -> float:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            print(f"{name} должен быть числом, используется {default}")
+            return default
+
+    def get_env_bool(self, name: str, default: bool) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().casefold() not in {"0", "false", "no", "off", "нет"}
+
+    def load_rag_config(self) -> Dict[str, Any]:
+        if not RAG_CONFIG_FILE.exists():
+            return {}
+        try:
+            with RAG_CONFIG_FILE.open("r", encoding="utf-8") as file:
+                loaded = yaml.safe_load(file) or {}
+            return loaded if isinstance(loaded, dict) else {}
+        except (OSError, yaml.YAMLError) as error:
+            print(f"Не удалось загрузить RAG config: {error}")
+            return {}
 
     def load_memories(self, legacy_memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not self.memory_file.exists():
@@ -835,6 +878,167 @@ class LLMChat:
             context_messages.extend(self.get_active_history()[-RECENT_MESSAGES_LIMIT:])
         return context_messages
 
+    def get_rag_setting(self, section: str, key: str, default: str) -> str:
+        section_value = self.rag_config.get(section, {})
+        if isinstance(section_value, dict):
+            value = section_value.get(key, default)
+            return str(value)
+        return default
+
+    def embed_rag_query(self, message: str) -> List[float]:
+        ollama_url = os.environ.get("AI_ADVENT_RAG_OLLAMA_URL") or self.get_rag_setting(
+            "embedding", "ollama_url", "http://localhost:11434"
+        )
+        model = os.environ.get("AI_ADVENT_RAG_EMBEDDING_MODEL") or self.get_rag_setting(
+            "embedding", "embedding_model", "nomic-embed-text"
+        )
+        response = requests.post(
+            f"{ollama_url.rstrip('/')}/api/embed",
+            json={"model": model, "input": [message]},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        embeddings = data.get("embeddings")
+        if embeddings is None and "embedding" in data:
+            embeddings = [data["embedding"]]
+        if not embeddings or not isinstance(embeddings[0], list):
+            raise RuntimeError(f"Unexpected Ollama embedding response: {data.keys()}")
+        return embeddings[0]
+
+    def search_rag(self, message: str) -> Optional[Dict[str, Any]]:
+        if not self.rag_enabled:
+            return None
+        try:
+            from qdrant_client import QdrantClient
+        except ImportError:
+            return None
+
+        qdrant_url = os.environ.get("AI_ADVENT_RAG_QDRANT_URL") or self.get_rag_setting(
+            "qdrant", "url", "http://localhost:6333"
+        )
+        collection = os.environ.get("AI_ADVENT_RAG_COLLECTION") or self.get_rag_setting(
+            "qdrant", "collection_name", "local_knowledge_base"
+        )
+
+        try:
+            query_vector = self.embed_rag_query(message)
+            client = QdrantClient(url=qdrant_url)
+            if hasattr(client, "query_points"):
+                result = client.query_points(
+                    collection_name=collection,
+                    query=query_vector,
+                    limit=self.rag_top_k,
+                    with_payload=True,
+                )
+                raw_points = getattr(result, "points", result)
+            else:
+                raw_points = client.search(
+                    collection_name=collection,
+                    query_vector=query_vector,
+                    limit=self.rag_top_k,
+                    with_payload=True,
+                )
+        except Exception as error:
+            if self.get_env_bool("AI_ADVENT_RAG_DEBUG", False):
+                print(f"RAG недоступен, используется обычная LLM: {error}")
+            return None
+
+        hits: List[Dict[str, Any]] = []
+        for point in raw_points:
+            score = float(getattr(point, "score", 0.0) or 0.0)
+            payload = getattr(point, "payload", None) or {}
+            if not isinstance(payload, dict):
+                continue
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                continue
+            hits.append(
+                {
+                    "score": score,
+                    "text": text,
+                    "source_path": str(
+                        payload.get("source_path")
+                        or payload.get("file_name")
+                        or "unknown"
+                    ),
+                    "chunk_index": payload.get("chunk_index"),
+                    "heading_path": payload.get("heading_path") or [],
+                    "page_start": payload.get("page_start"),
+                    "page_end": payload.get("page_end"),
+                }
+            )
+
+        best_score = max((hit["score"] for hit in hits), default=0.0)
+        if best_score < self.rag_score_threshold:
+            return None
+        return {"best_score": best_score, "hits": hits}
+
+    def format_rag_context(self, rag_context: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        used_chars = 0
+        for index, hit in enumerate(rag_context["hits"], 1):
+            heading = hit["heading_path"]
+            heading_text = (
+                " > ".join(str(item) for item in heading)
+                if isinstance(heading, list)
+                else str(heading)
+            )
+            location_parts = [hit["source_path"]]
+            if hit["chunk_index"] is not None:
+                location_parts.append(f"chunk {hit['chunk_index']}")
+            if hit["page_start"]:
+                location_parts.append(f"page {hit['page_start']}")
+            if heading_text:
+                location_parts.append(heading_text)
+            text = hit["text"]
+            remaining = self.rag_max_context_chars - used_chars
+            if remaining <= 0:
+                break
+            if len(text) > remaining:
+                text = text[:remaining].rstrip()
+            block = (
+                f"[{index}] score={hit['score']:.3f}; "
+                f"источник: {', '.join(location_parts)}\n"
+                f"{text}"
+            )
+            parts.append(block)
+            used_chars += len(text)
+        return "\n\n".join(parts)
+
+    def format_rag_sources(self, rag_context: Dict[str, Any]) -> str:
+        lines = []
+        seen = set()
+        for index, hit in enumerate(rag_context["hits"], 1):
+            key = (hit["source_path"], hit.get("chunk_index"))
+            if key in seen:
+                continue
+            seen.add(key)
+            chunk = (
+                f", chunk {hit['chunk_index']}"
+                if hit.get("chunk_index") is not None
+                else ""
+            )
+            lines.append(
+                f"{index}. {hit['source_path']}{chunk} "
+                f"(score {hit['score']:.3f})"
+            )
+        return "\n".join(lines)
+
+    def build_rag_system_prompt(
+        self, base_prompt: str, rag_context: Optional[Dict[str, Any]]
+    ) -> str:
+        if not rag_context:
+            return base_prompt
+        return (
+            f"{base_prompt}\n\n"
+            "RAG-КОНТЕКСТ ЛОКАЛЬНОЙ БАЗЫ ЗНАНИЙ:\n"
+            f"{self.format_rag_context(rag_context)}\n\n"
+            "Если RAG-контекст отвечает на вопрос, отвечай по нему. "
+            "Не придумывай факты вне найденных фрагментов; если фрагментов "
+            "не хватает, явно скажи, чего не хватает."
+        )
+
     def compact_history_if_needed(self) -> None:
         """Оставлено для совместимости со старым кодом: новые стратегии не сжимают history."""
         return
@@ -1021,6 +1225,8 @@ class LLMChat:
 8. Поле 'data' может содержать дополнительные данные
 """
         system_prompt = self.build_stateful_system_prompt(system_prompt)
+        rag_context = self.search_rag(message)
+        system_prompt = self.build_rag_system_prompt(system_prompt, rag_context)
 
         user_message = (
             f"Вопрос: {message}\n\nВерни ответ строго в указанном JSON формате."
@@ -1095,6 +1301,19 @@ class LLMChat:
                     self.save_conversation_state()
                     return None
 
+            if rag_context:
+                parsed_json.setdefault("data", {})
+                if isinstance(parsed_json["data"], dict):
+                    parsed_json["data"]["rag_best_score"] = rag_context["best_score"]
+                    parsed_json["data"]["rag_sources"] = [
+                        {
+                            "source_path": hit["source_path"],
+                            "chunk_index": hit["chunk_index"],
+                            "score": hit["score"],
+                        }
+                        for hit in rag_context["hits"]
+                    ]
+
             print(
                 f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
             )
@@ -1138,6 +1357,16 @@ class LLMChat:
                 "чтобы проверить ответ до показа."
             )
             return self.send_message_simple(message, temperature, system_prompt)
+
+        rag_context = self.search_rag(message)
+        if rag_context:
+            print(
+                "RAG: найден релевантный контекст "
+                f"(score {rag_context['best_score']:.3f}), ответ будет без streaming."
+            )
+            return self.send_message_simple(
+                message, temperature, system_prompt, rag_context=rag_context
+            )
 
         self.append_message("user", message)
         self.trim_active_history_if_needed()
@@ -1199,7 +1428,11 @@ class LLMChat:
             return None
 
     def send_message_simple(
-        self, message: str, temperature: float, system_prompt: str = "Ты полезный ассистент."
+        self,
+        message: str,
+        temperature: float,
+        system_prompt: str = "Ты полезный ассистент.",
+        rag_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Отправляет сообщение без потокового вывода, показывает время и токены"""
         refusal = self.build_invariant_refusal(message)
@@ -1210,11 +1443,17 @@ class LLMChat:
             self.print_token_counts(token_counts)
             return refusal
 
+        if rag_context is None:
+            rag_context = self.search_rag(message)
+        if rag_context:
+            print(f"RAG: используется локальная база, score {rag_context['best_score']:.3f}")
+
         self.append_message("user", message)
         self.trim_active_history_if_needed()
         self.update_facts_from_user_message(message)
 
         stateful_prompt = self.build_stateful_system_prompt(system_prompt)
+        stateful_prompt = self.build_rag_system_prompt(stateful_prompt, rag_context)
         payload: Dict[str, Any] = {
             "messages": [{"role": "system", "content": stateful_prompt}]
             + self.build_context_messages(),
@@ -1255,6 +1494,11 @@ class LLMChat:
                     )
                     self.save_conversation_state()
                     return None
+            if rag_context and "Источники:" not in assistant_message:
+                assistant_message = (
+                    f"{assistant_message.rstrip()}\n\n"
+                    f"Источники:\n{self.format_rag_sources(rag_context)}"
+                )
             print(f"\nАссистент: {assistant_message}")
 
             self.append_message("assistant", assistant_message)
@@ -1514,6 +1758,7 @@ class LLMChat:
         print("  /history - Показать историю диалога")
         print("  /memory  - Показать все три слоя памяти")
         print("  /status  - Проверить статус сервера")
+        print("  /rag-status - Проверить настройки RAG")
         print("  /json    - Режим JSON ответов")
         print("  /normal  - Обычный режим ответов")
         print("  /facts   - Показать facts (стратегия 2)")
@@ -1595,6 +1840,44 @@ class LLMChat:
             print("Сервер недоступен! Запустите сервер командой:")
             print("   ./start_server.sh medium")
             print(self.server_hint())
+        print()
+
+    def show_rag_status(self) -> None:
+        qdrant_url = os.environ.get("AI_ADVENT_RAG_QDRANT_URL") or self.get_rag_setting(
+            "qdrant", "url", "http://localhost:6333"
+        )
+        collection = os.environ.get("AI_ADVENT_RAG_COLLECTION") or self.get_rag_setting(
+            "qdrant", "collection_name", "local_knowledge_base"
+        )
+        ollama_url = os.environ.get("AI_ADVENT_RAG_OLLAMA_URL") or self.get_rag_setting(
+            "embedding", "ollama_url", "http://localhost:11434"
+        )
+        model = os.environ.get("AI_ADVENT_RAG_EMBEDDING_MODEL") or self.get_rag_setting(
+            "embedding", "embedding_model", "nomic-embed-text"
+        )
+        try:
+            from qdrant_client import QdrantClient
+
+            qdrant_installed = True
+            try:
+                client = QdrantClient(url=qdrant_url)
+                collections = {item.name for item in client.get_collections().collections}
+                qdrant_ready = collection in collections
+            except Exception:
+                qdrant_ready = False
+        except ImportError:
+            qdrant_installed = False
+            qdrant_ready = False
+
+        print("\nRAG:")
+        print(f"Включен: {'да' if self.rag_enabled else 'нет'}")
+        print(f"Qdrant URL: {qdrant_url}")
+        print(f"Collection: {collection}")
+        print(f"Ollama embeddings: {ollama_url} / {model}")
+        print(f"Threshold: {self.rag_score_threshold}")
+        print(f"Top-K: {self.rag_top_k}")
+        print(f"qdrant-client установлен: {'да' if qdrant_installed else 'нет'}")
+        print(f"Коллекция доступна: {'да' if qdrant_ready else 'нет'}")
         print()
 
     def show_facts(self) -> None:
@@ -1843,6 +2126,11 @@ class LLMChat:
         print(f"Стратегия контекста: {self.context_strategy}")
         print(f"Активный пользователь: {self.current_user}")
         print(f"LLM API: {self.api_url}")
+        print(
+            "RAG: "
+            f"{'включен' if self.rag_enabled else 'выключен'}, "
+            f"threshold {self.rag_score_threshold}, top_k {self.rag_top_k}"
+        )
         print("Введите /help для списка команд")
         print(f"Файл памяти: {self.memory_file}")
         active_history = self.get_active_history()
@@ -1891,6 +2179,9 @@ class LLMChat:
                     continue
                 elif user_input == "/status":
                     self.check_status()
+                    continue
+                elif user_input == "/rag-status":
+                    self.show_rag_status()
                     continue
                 elif user_input == "/facts":
                     self.show_facts()
