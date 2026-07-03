@@ -65,6 +65,7 @@ DEFAULT_RAG_SCORE_THRESHOLD = 0.72
 DEFAULT_RAG_PRE_TOP_K = 10
 DEFAULT_RAG_TOP_K = 5
 DEFAULT_RAG_MAX_CONTEXT_CHARS = 12000
+DEFAULT_RAG_QUOTE_CHARS = 280
 HISTORY_FILE = Path(__file__).with_name("conversation_history.json")
 SUMMARY_FILE = Path(__file__).with_name("conversation_summary.json")
 FACTS_FILE = Path(__file__).with_name("conversation_facts.json")
@@ -209,8 +210,14 @@ class LLMChat:
             "AI_ADVENT_RAG_MAX_CONTEXT_CHARS",
             DEFAULT_RAG_MAX_CONTEXT_CHARS,
         )
+        self.rag_quote_chars = self.get_env_int(
+            "AI_ADVENT_RAG_QUOTE_CHARS", DEFAULT_RAG_QUOTE_CHARS
+        )
         self.rag_query_rewrite_enabled = self.get_env_bool(
             "AI_ADVENT_RAG_QUERY_REWRITE", True
+        )
+        self.rag_strict_unknown = self.get_env_bool(
+            "AI_ADVENT_RAG_STRICT_UNKNOWN", True
         )
         self.trim_active_history_if_needed()
 
@@ -1054,7 +1061,16 @@ class LLMChat:
                 if self.get_env_bool("AI_ADVENT_RAG_DEBUG", False):
                     print(f"RAG fallback по исходному вопросу не сработал: {error}")
         if not filtered_hits:
-            return None
+            return {
+                "best_score": best_score,
+                "hits": [],
+                "raw_hit_count": len(hits),
+                "filtered_hit_count": 0,
+                "query": message,
+                "rewritten_query": rewritten_query,
+                "fallback_to_original_query": fallback_used,
+                "weak_context": True,
+            }
         return {
             "best_score": best_score,
             "hits": filtered_hits,
@@ -1063,6 +1079,7 @@ class LLMChat:
             "query": message,
             "rewritten_query": rewritten_query,
             "fallback_to_original_query": fallback_used,
+            "weak_context": False,
         }
 
     def format_rag_context(self, rag_context: Dict[str, Any]) -> str:
@@ -1118,10 +1135,53 @@ class LLMChat:
             )
         return "\n".join(lines)
 
+    def quote_from_hit(self, hit: Dict[str, Any]) -> str:
+        text = " ".join(str(hit.get("text", "")).split())
+        if len(text) <= self.rag_quote_chars:
+            return text
+        return text[: self.rag_quote_chars].rstrip() + "..."
+
+    def format_rag_required_sections(self, answer: str, rag_context: Dict[str, Any]) -> str:
+        sources = []
+        quotes = []
+        for index, hit in enumerate(rag_context["hits"], 1):
+            section = hit.get("heading_path") or []
+            section_text = (
+                " > ".join(str(item) for item in section)
+                if isinstance(section, list)
+                else str(section)
+            )
+            chunk_id = hit.get("chunk_index")
+            sources.append(
+                f"{index}. source={hit['source_path']}; "
+                f"section={section_text or 'unknown'}; chunk_id={chunk_id}; "
+                f"score={hit['score']:.3f}; "
+                f"rerank={hit.get('rerank_score', hit['score']):.3f}"
+            )
+            quotes.append(f"{index}. \"{self.quote_from_hit(hit)}\"")
+        return (
+            f"Ответ:\n{answer.strip()}\n\n"
+            "Источники:\n"
+            + "\n".join(sources)
+            + "\n\nЦитаты:\n"
+            + "\n".join(quotes)
+        )
+
+    def build_weak_context_response(self, rag_context: Dict[str, Any]) -> str:
+        return (
+            "Ответ:\n"
+            "Не знаю: в локальной базе не найден достаточно релевантный контекст. "
+            "Пожалуйста, уточните вопрос или добавьте более подходящие документы в RAG.\n\n"
+            "Источники:\nнет источников выше порога релевантности\n\n"
+            "Цитаты:\nнет цитат выше порога релевантности\n\n"
+            f"Диагностика: best_score={rag_context.get('best_score', 0.0):.3f}, "
+            f"threshold={self.rag_score_threshold:.3f}"
+        )
+
     def build_rag_system_prompt(
         self, base_prompt: str, rag_context: Optional[Dict[str, Any]]
     ) -> str:
-        if not rag_context:
+        if not rag_context or rag_context.get("weak_context"):
             return base_prompt
         return (
             f"{base_prompt}\n\n"
@@ -1129,7 +1189,14 @@ class LLMChat:
             f"{self.format_rag_context(rag_context)}\n\n"
             "Если RAG-контекст отвечает на вопрос, отвечай по нему. "
             "Не придумывай факты вне найденных фрагментов; если фрагментов "
-            "не хватает, явно скажи, чего не хватает."
+            "не хватает, явно скажи, чего не хватает.\n\n"
+            "ФОРМАТ ОТВЕТА ОБЯЗАТЕЛЕН:\n"
+            "Ответ:\n<краткий ответ по контексту>\n\n"
+            "Источники:\n"
+            "<нумерованный список: source=<файл>; section=<раздел>; chunk_id=<id>>\n\n"
+            "Цитаты:\n"
+            "<нумерованный список коротких дословных фрагментов из найденных чанков, "
+            "которые подтверждают ответ>"
         )
 
     def compact_history_if_needed(self) -> None:
@@ -1319,6 +1386,27 @@ class LLMChat:
 """
         system_prompt = self.build_stateful_system_prompt(system_prompt)
         rag_context = self.search_rag(message)
+        if rag_context and rag_context.get("weak_context") and self.rag_strict_unknown:
+            parsed_json = {
+                "answer": "Не знаю: в локальной базе не найден достаточно релевантный контекст. Пожалуйста, уточните вопрос.",
+                "confidence": 0.0,
+                "intent": "question",
+                "data": {
+                    "rag_weak_context": True,
+                    "rag_best_score": rag_context.get("best_score", 0.0),
+                    "rag_threshold": self.rag_score_threshold,
+                    "sources": [],
+                    "quotes": [],
+                },
+            }
+            validate(instance=parsed_json, schema=schema_to_use)
+            serialized = json.dumps(parsed_json, ensure_ascii=False)
+            self.record_local_response(message, serialized)
+            self.last_token_counts = self.build_token_counts(message, serialized)
+            print(
+                f"\nJSON ответ: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}"
+            )
+            return parsed_json
         system_prompt = self.build_rag_system_prompt(system_prompt, rag_context)
 
         user_message = (
@@ -1402,8 +1490,17 @@ class LLMChat:
                         {
                             "source_path": hit["source_path"],
                             "chunk_index": hit["chunk_index"],
+                            "section": hit.get("heading_path") or [],
                             "score": hit["score"],
                             "rerank_score": hit.get("rerank_score"),
+                        }
+                        for hit in rag_context["hits"]
+                    ]
+                    parsed_json["data"]["rag_quotes"] = [
+                        {
+                            "source_path": hit["source_path"],
+                            "chunk_index": hit["chunk_index"],
+                            "quote": self.quote_from_hit(hit),
                         }
                         for hit in rag_context["hits"]
                     ]
@@ -1453,6 +1550,15 @@ class LLMChat:
             return self.send_message_simple(message, temperature, system_prompt)
 
         rag_context = self.search_rag(message)
+        if rag_context and rag_context.get("weak_context") and self.rag_strict_unknown:
+            print(
+                "RAG: контекст ниже порога "
+                f"(score {rag_context.get('best_score', 0.0):.3f}), "
+                "ответ будет без streaming."
+            )
+            return self.send_message_simple(
+                message, temperature, system_prompt, rag_context=rag_context
+            )
         if rag_context:
             print(
                 "RAG: найден релевантный контекст "
@@ -1542,6 +1648,13 @@ class LLMChat:
 
         if rag_context is None:
             rag_context = self.search_rag(message)
+        if rag_context and rag_context.get("weak_context") and self.rag_strict_unknown:
+            assistant_message = self.build_weak_context_response(rag_context)
+            self.record_local_response(message, assistant_message)
+            print(f"\nАссистент: {assistant_message}")
+            token_counts = self.build_token_counts(message, assistant_message)
+            self.print_token_counts(token_counts)
+            return assistant_message
         if rag_context:
             print(
                 f"RAG: используется локальная база, score {rag_context['best_score']:.3f}, "
@@ -1595,10 +1708,12 @@ class LLMChat:
                     )
                     self.save_conversation_state()
                     return None
-            if rag_context and "Источники:" not in assistant_message:
-                assistant_message = (
-                    f"{assistant_message.rstrip()}\n\n"
-                    f"Источники:\n{self.format_rag_sources(rag_context)}"
+            if rag_context and (
+                "Источники:" not in assistant_message
+                or "Цитаты:" not in assistant_message
+            ):
+                assistant_message = self.format_rag_required_sections(
+                    assistant_message, rag_context
                 )
             print(f"\nАссистент: {assistant_message}")
 
@@ -1979,6 +2094,8 @@ class LLMChat:
         print(f"Top-K до фильтрации: {self.rag_pre_top_k}")
         print(f"Top-K после фильтрации: {self.rag_top_k}")
         print(f"Query rewrite: {'да' if self.rag_query_rewrite_enabled else 'нет'}")
+        print(f"Строгое 'не знаю' ниже порога: {'да' if self.rag_strict_unknown else 'нет'}")
+        print(f"Максимальная длина цитаты: {self.rag_quote_chars} символов")
         print(f"qdrant-client установлен: {'да' if qdrant_installed else 'нет'}")
         print(f"Коллекция доступна: {'да' if qdrant_ready else 'нет'}")
         print()

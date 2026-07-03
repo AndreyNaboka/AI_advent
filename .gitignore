@@ -15,6 +15,9 @@ task_state.json
 invariants.json
 agent_memory.json
 periodic_dialog_summary.json
+mini_chat_state.json
+mini_chat_state_*.json
+mini_chat_scenario_report.json
 
 # Clean export artifacts
 AI_advent_export/
@@ -30,3 +33,4 @@ rag_indexer_tool/*.jsonl
 rag_eval_report.json
 rag_retrieval_report.json
 rag_rerank_eval_report.json
+rag_cited_eval_report.json

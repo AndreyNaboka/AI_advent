@@ -212,7 +212,13 @@ def build_answer_from_context(
     temperature: float,
 ) -> str:
     if not hits:
-        return ""
+        return (
+            "Ответ:\n"
+            "Не знаю: в локальной базе не найден достаточно релевантный контекст. "
+            "Пожалуйста, уточните вопрос.\n\n"
+            "Источники:\nнет источников выше порога релевантности\n\n"
+            "Цитаты:\nнет цитат выше порога релевантности"
+        )
     rag_context = build_rag_context(hits, max_context_chars)
     return ask_llm(
         api_url,
@@ -222,6 +228,13 @@ def build_answer_from_context(
                 "content": (
                     "Answer only from the provided RAG context. "
                     "If the context is insufficient, say exactly what is missing.\n\n"
+                    "You must use this exact structure:\n"
+                    "Ответ:\n<short answer>\n\n"
+                    "Источники:\n"
+                    "<numbered list with source=<file>; section=<section>; chunk_id=<chunk>>\n\n"
+                    "Цитаты:\n"
+                    "<numbered list of short verbatim quotes from the retrieved chunks "
+                    "that support the answer>\n\n"
                     f"RAG context:\n{rag_context}"
                 ),
             },
@@ -241,6 +254,73 @@ def sources_match(hits: list[dict[str, Any]], expected_sources: list[str]) -> bo
         return True
     source_text = "\n".join(hit["source_path"] for hit in hits).casefold()
     return all(expected.casefold() in source_text for expected in expected_sources)
+
+
+def section_after(answer: str, header: str) -> str:
+    marker = f"{header}:"
+    if marker not in answer:
+        return ""
+    tail = answer.split(marker, 1)[1]
+    for next_header in ("Ответ:", "Источники:", "Цитаты:"):
+        if next_header != marker and next_header in tail:
+            tail = tail.split(next_header, 1)[0]
+    return tail.strip()
+
+
+def has_required_rag_sections(answer: str) -> bool:
+    return all(header in answer for header in ("Ответ:", "Источники:", "Цитаты:"))
+
+
+def has_nonempty_sources_and_quotes(answer: str) -> tuple[bool, bool]:
+    sources = section_after(answer, "Источники")
+    quotes = section_after(answer, "Цитаты")
+    bad_markers = ("нет источников", "нет цитат", "<", "not requested")
+    sources_ok = bool(sources) and not any(marker in sources.casefold() for marker in bad_markers)
+    quotes_ok = bool(quotes) and not any(marker in quotes.casefold() for marker in bad_markers)
+    return sources_ok, quotes_ok
+
+
+def quotes_support_expected(answer: str, expected: list[str]) -> bool:
+    quotes = section_after(answer, "Цитаты").casefold()
+    if not expected:
+        return bool(quotes)
+    return any(item.casefold() in quotes for item in expected)
+
+
+def build_unknown_context_test(
+    args: argparse.Namespace,
+    api_url: str,
+    ollama_url: str,
+    embedding_model: str,
+    qdrant_url: str,
+    collection: str,
+) -> dict[str, Any]:
+    question = args.weak_question
+    rewritten = question if args.no_query_rewrite else rewrite_query(api_url, question)
+    vector = embed_query(ollama_url, embedding_model, rewritten)
+    raw_hits = search_chunks(qdrant_url, collection, vector, args.pre_top_k)
+    filtered = filter_and_rerank(
+        raw_hits,
+        question,
+        rewritten,
+        args.weak_threshold,
+        args.post_top_k,
+    )
+    answer = build_answer_from_context(
+        api_url,
+        question,
+        filtered,
+        args.max_context_chars,
+        args.temperature,
+    )
+    return {
+        "question": question,
+        "threshold": args.weak_threshold,
+        "best_score": max((hit["score"] for hit in raw_hits), default=0.0),
+        "kept": len(filtered),
+        "answer": answer,
+        "passed": "не знаю" in answer.casefold() and len(filtered) == 0,
+    }
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
@@ -364,6 +444,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         improved_answer_ok = contains_all(improved_rag_answer, expected_answer)
         basic_sources_ok = sources_match(basic_hits, expected_sources)
         improved_sources_ok = sources_match(improved_hits, expected_sources)
+        improved_sections_ok = has_required_rag_sections(improved_rag_answer)
+        improved_output_sources_ok, improved_output_quotes_ok = (
+            has_nonempty_sources_and_quotes(improved_rag_answer)
+        )
+        improved_quotes_support_ok = quotes_support_expected(
+            improved_rag_answer, expected_answer
+        )
 
         results.append(
             {
@@ -403,6 +490,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "basic_expected_sources_used": basic_sources_ok,
                     "improved_expected_sources_used": improved_sources_ok,
                     "expected_sources_used": improved_sources_ok,
+                    "improved_has_required_sections": improved_sections_ok,
+                    "improved_answer_has_sources": improved_output_sources_ok,
+                    "improved_answer_has_quotes": improved_output_quotes_ok,
+                    "improved_quotes_support_answer": improved_quotes_support_ok,
                 },
             }
         )
@@ -418,7 +509,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         for item in results
         if item["checks"]["improved_rag_answer_contains_expected"]
         and item["checks"]["improved_expected_sources_used"]
+        and item["checks"]["improved_has_required_sections"]
+        and item["checks"]["improved_answer_has_sources"]
+        and item["checks"]["improved_answer_has_quotes"]
+        and item["checks"]["improved_quotes_support_answer"]
     )
+    weak_context_test = None
+    if args.include_weak_context_test and not args.retrieval_only:
+        weak_context_test = build_unknown_context_test(
+            args,
+            api_url,
+            ollama_url,
+            embedding_model,
+            qdrant_url,
+            collection,
+        )
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "api_url": api_url,
@@ -435,6 +540,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "improved_passed": improved_passed,
         "passed": improved_passed,
         "total": len(results),
+        "weak_context_test": weak_context_test,
         "results": results,
     }
 
@@ -478,6 +584,10 @@ def print_summary(report: dict[str, Any]) -> None:
             "PASS"
             if checks["improved_rag_answer_contains_expected"]
             and checks["improved_expected_sources_used"]
+            and checks["improved_has_required_sections"]
+            and checks["improved_answer_has_sources"]
+            and checks["improved_answer_has_quotes"]
+            and checks["improved_quotes_support_answer"]
             else "FAIL"
         )
         print(
@@ -486,7 +596,19 @@ def print_summary(report: dict[str, Any]) -> None:
             f"improved={improved_status} score={item['improved_best_score']:.3f}, "
             f"kept={len(item['improved_sources'])}/"
             f"{len(item['raw_improved_sources'])}, "
-            f"fallback={item['fallback_to_original_query']}"
+            f"fallback={item['fallback_to_original_query']}, "
+            f"sources={checks['improved_answer_has_sources']}, "
+            f"quotes={checks['improved_answer_has_quotes']}, "
+            f"quote_support={checks['improved_quotes_support_answer']}"
+        )
+    weak_context_test = report.get("weak_context_test")
+    if weak_context_test:
+        status = "PASS" if weak_context_test["passed"] else "FAIL"
+        print(
+            f"Weak context test: {status}, "
+            f"best_score={weak_context_test['best_score']:.3f}, "
+            f"threshold={weak_context_test['threshold']:.3f}, "
+            f"kept={weak_context_test['kept']}"
         )
 
 
@@ -506,6 +628,7 @@ def print_answers(report: dict[str, Any]) -> None:
         print(item["improved_rag_answer"] or "<RAG was not used>")
         print(f"\nQUERY REWRITE:\n{item['rewritten_query']}")
         print(f"FALLBACK TO ORIGINAL QUERY: {item['fallback_to_original_query']}")
+        print(f"CHECKS: {json.dumps(item['checks'], ensure_ascii=False)}")
         print("\nBASIC SOURCES:")
         if item["basic_sources"]:
             for source in item["basic_sources"]:
@@ -531,6 +654,18 @@ def print_answers(report: dict[str, Any]) -> None:
                 )
         else:
             print("<no sources after filtering>")
+        print("-" * 80)
+    weak_context_test = report.get("weak_context_test")
+    if weak_context_test:
+        print("\nWEAK CONTEXT TEST")
+        print(f"QUESTION:\n{weak_context_test['question']}")
+        print(
+            f"best_score={weak_context_test['best_score']:.3f}, "
+            f"threshold={weak_context_test['threshold']:.3f}, "
+            f"kept={weak_context_test['kept']}"
+        )
+        print("ANSWER:")
+        print(weak_context_test["answer"])
         print("-" * 80)
 
 
@@ -578,6 +713,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-query-rewrite",
         action="store_true",
         help="Disable LLM query rewrite for the improved RAG mode.",
+    )
+    parser.add_argument(
+        "--include-weak-context-test",
+        action="store_true",
+        help="Also verify the 'не знаю' answer when context is below threshold.",
+    )
+    parser.add_argument(
+        "--weak-question",
+        default="What is the warranty period for the Neptune-999 quantum toaster?",
+        help="Question used for the weak-context 'не знаю' test.",
+    )
+    parser.add_argument(
+        "--weak-threshold",
+        type=float,
+        default=0.95,
+        help="High threshold used to force the weak-context branch in the demo.",
     )
     return parser
 
