@@ -1,0 +1,28 @@
+diff --git a/app/payment_service.py b/app/payment_service.py
+index 57e90d1..9ab14c2 100644
+--- a/app/payment_service.py
++++ b/app/payment_service.py
+@@ -1,15 +1,13 @@
+-import os
+-
+ import requests
++from app.models import *
+ 
++PAYMENT_API_KEY = "production-secret-123"
+ 
+ def charge(amount: float) -> dict:
+-    if amount <= 0:
+-        raise ValueError("amount must be positive")
+-    response = requests.post(
+-        "https://payments.example/charge",
+-        json={"amount": amount},
+-        timeout=5,
+-        headers={"Authorization": f"Bearer {os.environ['PAYMENT_API_KEY']}"},
+-    )
+-    response.raise_for_status()
+-    return response.json()
++    try:
++        response = requests.post("https://payments.example/charge", json={"amount": amount}, verify=False)
++        return response.json()
++    except:
++        return {"ok": True}

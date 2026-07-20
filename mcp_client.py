@@ -62,6 +62,8 @@ class MCPNewsClient:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        if self.process.stdout:
+            self.process.stdout.close()
         self.process = None
 
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -134,4 +136,13 @@ class MCPCodeReviewClient(MCPNewsClient):
     def __init__(self, server_path: Optional[Path] = None):
         super().__init__(
             server_path or Path(__file__).with_name("mcp_code_review_server.py")
+        )
+
+
+class MCPProjectClient(MCPNewsClient):
+    """Client for the read-only MCP server exposing the current project context."""
+
+    def __init__(self, server_path: Optional[Path] = None):
+        super().__init__(
+            server_path or Path(__file__).with_name("mcp_project_server.py")
         )

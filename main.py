@@ -33,6 +33,7 @@ from mcp_client import (
     MCPNewsClient,
     MCPPeriodicSummaryClient,
 )
+from project_help import ProjectHelpAssistant
 
 DEFAULT_API_BASE = "http://localhost:8080"
 DEFAULT_API_PATH = "/v1/chat/completions"
@@ -183,6 +184,7 @@ class LLMChat:
         self.mcp_client = MCPNewsClient()
         self.summary_mcp_client = MCPPeriodicSummaryClient()
         self.code_review_mcp_client = MCPCodeReviewClient()
+        self.project_help_assistant = ProjectHelpAssistant()
         self.last_code_review_problems: List[Dict[str, Any]] = []
         self.last_code_review_folder: Optional[str] = None
         self.summary_stop_event = Event()
@@ -2011,7 +2013,8 @@ class LLMChat:
         print("  Также можно: сделай ревью /path/to/project")
         print("  Также можно: запиши баги в папку")
         print("  Также можно: исправь баги")
-        print("  /help    - Показать эту справку")
+        print("  /help                - Показать эту справку")
+        print("  /help <вопрос>       - Ответить по README/docs + MCP-контексту проекта")
         print("  /exit    - Выйти из программы")
         print("=" * 50 + "\n")
 
@@ -2399,6 +2402,9 @@ class LLMChat:
                 elif user_input == "/help":
                     self.show_help()
                     continue
+                elif user_input.startswith("/help "):
+                    print("\n" + self.project_help_assistant.ask(user_input[6:]) + "\n")
+                    continue
                 elif user_input == "/status":
                     self.check_status()
                     continue
@@ -2560,6 +2566,7 @@ class LLMChat:
         self.stop_periodic_summary()
         self.mcp_client.stop()
         self.code_review_mcp_client.stop()
+        self.project_help_assistant.close()
 
 
 def main() -> None:
