@@ -8,7 +8,7 @@ index 57e90d1..9ab14c2 100644
  import requests
 +from app.models import *
  
-+PAYMENT_API_KEY = "production-secret-123"
++PAYMENT_API_KEY = "FAKE_DEMO_SECRET_DO_NOT_USE"
  
  def charge(amount: float) -> dict:
 -    if amount <= 0:

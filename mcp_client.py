@@ -146,3 +146,12 @@ class MCPProjectClient(MCPNewsClient):
         super().__init__(
             server_path or Path(__file__).with_name("mcp_project_server.py")
         )
+
+
+class MCPCRMClient(MCPNewsClient):
+    """Client for the read-only JSON CRM used by the support assistant."""
+
+    def __init__(self, server_path: Optional[Path] = None):
+        super().__init__(
+            server_path or Path(__file__).with_name("mcp_crm_server.py")
+        )

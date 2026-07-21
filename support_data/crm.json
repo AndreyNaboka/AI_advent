@@ -1,0 +1,81 @@
+{
+  "users": [
+    {
+      "id": "USR-1001",
+      "name": "Анна Демо",
+      "email": "anna.demo@example.test",
+      "plan": "pro",
+      "account_status": "active",
+      "created_at": "2026-01-15T10:00:00Z",
+      "locale": "ru-RU"
+    },
+    {
+      "id": "USR-1002",
+      "name": "Борис Демо",
+      "email": "boris.demo@example.test",
+      "plan": "trial",
+      "account_status": "pending_verification",
+      "created_at": "2026-07-18T12:30:00Z",
+      "locale": "ru-RU"
+    },
+    {
+      "id": "USR-1003",
+      "name": "Вера Демо",
+      "email": "vera@old-company.example.test",
+      "plan": "business",
+      "account_status": "active",
+      "created_at": "2025-11-02T08:15:00Z",
+      "locale": "ru-RU"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "TCK-1001",
+      "user_id": "USR-1001",
+      "status": "open",
+      "priority": "high",
+      "category": "authentication",
+      "subject": "Не могу войти после нескольких попыток",
+      "description": "После нескольких неверных паролей форма входа больше не принимает правильный пароль.",
+      "diagnostic_code": "AUTH_ACCOUNT_LOCKED",
+      "tags": ["login", "password", "locked"],
+      "signals": {
+        "failed_attempts": 7,
+        "account_locked": true,
+        "locked_until": "2026-07-21T15:30:00Z"
+      }
+    },
+    {
+      "id": "TCK-1002",
+      "user_id": "USR-1002",
+      "status": "open",
+      "priority": "normal",
+      "category": "authentication",
+      "subject": "Авторизация не работает после регистрации",
+      "description": "Новый пользователь не может войти сразу после создания аккаунта.",
+      "diagnostic_code": "AUTH_EMAIL_UNVERIFIED",
+      "tags": ["login", "email", "verification"],
+      "signals": {
+        "email_verified": false,
+        "verification_sent": true,
+        "last_verification_sent_at": "2026-07-21T11:10:00Z"
+      }
+    },
+    {
+      "id": "TCK-1003",
+      "user_id": "USR-1003",
+      "status": "open",
+      "priority": "normal",
+      "category": "sso",
+      "subject": "Корпоративный SSO отклоняет вход",
+      "description": "После смены домена компании вход через SSO возвращает ошибку domain mismatch.",
+      "diagnostic_code": "AUTH_SSO_DOMAIN_MISMATCH",
+      "tags": ["sso", "business", "domain"],
+      "signals": {
+        "requested_domain": "old-company.example.test",
+        "configured_domain": "new-company.example.test",
+        "idp_status": "available"
+      }
+    }
+  ]
+}

@@ -82,3 +82,20 @@ venv312/bin/python pr_review.py --base-ref main --head-ref HEAD
 venv312/bin/python -m unittest discover -s tests -v
 venv312/bin/python project_help.py --question "Как устроен проект?"
 ```
+
+## AI-ассистент поддержки
+
+`support_service.py` отвечает на вопросы о продукте по FAQ и документации из
+`support_kb/`. Контекст пользователя и тикета загружается из тестовой JSON CRM
+через read-only MCP-сервер `mcp_crm_server.py`.
+
+Быстрая демонстрация:
+
+```bash
+venv312/bin/python support_service.py \
+  --ticket TCK-1001 \
+  --question "Почему не работает авторизация?"
+```
+
+Для локального HTTP API используйте `support_service.py --serve`. Тестовые
+тикеты и полный пользовательский сценарий описаны в `docs/support_assistant.md`.

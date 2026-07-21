@@ -2,6 +2,7 @@
 docs/*
 !docs/project_assistant.md
 !docs/pr_review.md
+!docs/support_assistant.md
 .DS_Store
 bugs/
 __pycache__/
