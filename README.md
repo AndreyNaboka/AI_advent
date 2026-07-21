@@ -99,3 +99,20 @@ venv312/bin/python support_service.py \
 
 Для локального HTTP API используйте `support_service.py --serve`. Тестовые
 тикеты и полный пользовательский сценарий описаны в `docs/support_assistant.md`.
+
+## Файловый ассистент
+
+`file_assistant.py` выполняет реальные операции с файлами через ограниченный
+MCP-сервер `mcp_filesystem_server.py`. Пользователь формулирует цель, после чего
+ассистент сам ищет и читает несколько файлов, анализирует их, создаёт или
+обновляет артефакт и показывает unified diff.
+
+```bash
+venv312/bin/python file_assistant.py \
+  --goal 'Найди все использования компонента "MCPCRMClient" и подготовь отчёт'
+
+venv312/bin/python file_assistant.py \
+  --goal 'Обнови документацию по структуре Python-модулей проекта'
+```
+
+Подробные сценарии и dry-run описаны в `docs/file_assistant.md`.

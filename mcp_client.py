@@ -155,3 +155,12 @@ class MCPCRMClient(MCPNewsClient):
         super().__init__(
             server_path or Path(__file__).with_name("mcp_crm_server.py")
         )
+
+
+class MCPFileToolsClient(MCPNewsClient):
+    """Client for constrained project file operations over MCP."""
+
+    def __init__(self, server_path: Optional[Path] = None):
+        super().__init__(
+            server_path or Path(__file__).with_name("mcp_filesystem_server.py")
+        )
